@@ -1,0 +1,60 @@
+# ROS2 build artifacts
+/build/
+/install/
+/log/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+yolo_obb_venv/
+
+# Editors
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs / temp files
+*.log
+*.tmp
+*.bak
+*.bak_*
+*_backup_*
+
+# ML models and generated artifacts
+*.pt
+*.onnx
+*.engine
+
+# ROS bags / databases
+*.bag
+*.db3
+*.mcap
+
+# Generated datasets / outputs
+/bev_dataset/
+/backgrounds/
+/snapshots/
+/runs/
+/predictions/
+/label_previews/
+/cvat_exports/
+/candidates_empty_bev_review/
+
+# Large generated arrays
+*.npz
+*.npy

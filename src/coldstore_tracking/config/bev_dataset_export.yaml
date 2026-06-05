@@ -1,0 +1,18 @@
+bev_dataset_export_node:
+  ros__parameters:
+    input_topic: /rslidar_points
+    expected_frame_id: rslidar
+    output_root: ~/ros2_ws/bev_dataset
+
+    roi_min: [-14.5, -15.0, -2.0]
+    roi_max: [9.0, 6.0, 3.0]
+    resolution_m_per_px: 0.01
+
+    sample_interval_sec: 60.0
+    min_save_interval_sec: 1800.0
+    max_save_interval_sec: 1800.0
+    keyframe_change_ratio: 1.0
+
+    density_clip_count: 12
+    min_points_to_save: 1000
+    max_saved_frames: 0

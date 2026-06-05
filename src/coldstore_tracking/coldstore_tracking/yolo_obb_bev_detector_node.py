@@ -1,0 +1,1444 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+import rclpy
+from geometry_msgs.msg import Pose, PoseArray
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
+
+try:
+    from ultralytics import YOLO
+except ImportError as exc:
+    YOLO = None
+    YOLO_IMPORT_ERROR = exc
+else:
+    YOLO_IMPORT_ERROR = None
+
+
+@dataclass(frozen=True)
+class BevGeometry:
+    roi_min: np.ndarray
+    roi_max: np.ndarray
+    resolution_m_per_px: float
+    width_px: int
+    height_px: int
+
+    @staticmethod
+    def from_values(
+        roi_min: list[float],
+        roi_max: list[float],
+        resolution_m_per_px: float,
+    ) -> "BevGeometry":
+        min_values = np.asarray(roi_min, dtype=np.float32)
+        max_values = np.asarray(roi_max, dtype=np.float32)
+
+        width_px = int(math.ceil((float(max_values[0]) - float(min_values[0])) / resolution_m_per_px))
+        height_px = int(math.ceil((float(max_values[1]) - float(min_values[1])) / resolution_m_per_px))
+
+        return BevGeometry(
+            roi_min=min_values,
+            roi_max=max_values,
+            resolution_m_per_px=float(resolution_m_per_px),
+            width_px=width_px,
+            height_px=height_px,
+        )
+
+    def filter_points_to_roi(self, points_xyz: np.ndarray) -> np.ndarray:
+        if points_xyz.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        x_values = points_xyz[:, 0]
+        y_values = points_xyz[:, 1]
+        z_values = points_xyz[:, 2]
+
+        roi_mask = (
+            (x_values >= self.roi_min[0])
+            & (x_values <= self.roi_max[0])
+            & (y_values >= self.roi_min[1])
+            & (y_values <= self.roi_max[1])
+            & (z_values >= self.roi_min[2])
+            & (z_values <= self.roi_max[2])
+        )
+
+        return points_xyz[roi_mask].astype(np.float32)
+
+    def points_to_pixels(self, points_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        filtered_points = self.filter_points_to_roi(points_xyz)
+
+        if filtered_points.size == 0:
+            return (
+                np.empty(0, dtype=np.int32),
+                np.empty(0, dtype=np.int32),
+                filtered_points,
+            )
+
+        u_values = np.floor((filtered_points[:, 0] - self.roi_min[0]) / self.resolution_m_per_px).astype(np.int32)
+        v_values = np.floor((self.roi_max[1] - filtered_points[:, 1]) / self.resolution_m_per_px).astype(np.int32)
+
+        image_mask = (
+            (u_values >= 0)
+            & (u_values < self.width_px)
+            & (v_values >= 0)
+            & (v_values < self.height_px)
+        )
+
+        return u_values[image_mask], v_values[image_mask], filtered_points[image_mask]
+
+    def pixel_to_world_xy(self, pixel_xy: np.ndarray) -> np.ndarray:
+        pixel_xy = np.asarray(pixel_xy, dtype=np.float32)
+
+        u_values = pixel_xy[:, 0]
+        v_values = pixel_xy[:, 1]
+
+        x_values = self.roi_min[0] + (u_values + 0.5) * self.resolution_m_per_px
+        y_values = self.roi_max[1] - (v_values + 0.5) * self.resolution_m_per_px
+
+        return np.stack((x_values, y_values), axis=1).astype(np.float32)
+
+
+@dataclass(frozen=True)
+class TileWindow:
+    x_min: int
+    y_min: int
+    size: int
+
+    @property
+    def x_max(self) -> int:
+        return self.x_min + self.size
+
+    @property
+    def y_max(self) -> int:
+        return self.y_min + self.size
+
+
+@dataclass(frozen=True)
+class DetectionCandidate:
+    class_id: int
+    class_name: str
+    confidence: float
+    pixel_corners: np.ndarray
+    source_tile: TileWindow
+
+
+@dataclass(frozen=True)
+class RackDetection:
+    detection_id: int
+    class_id: int
+    class_name: str
+    confidence: float
+    center_x: float
+    center_y: float
+    center_z: float
+    yaw: float
+    length: float
+    width: float
+    height: float
+    corners_xy: list[list[float]]
+    track_state: str = "raw"
+    hit_count: int = 1
+    missed_count: int = 0
+
+
+@dataclass
+class RackTrack:
+    track_id: int
+    class_id: int
+    class_name: str
+    confidence: float
+    center_x: float
+    center_y: float
+    center_z: float
+    yaw: float
+    length: float
+    width: float
+    height: float
+    corners_xy: list[list[float]]
+    first_seen_sec: float
+    last_seen_sec: float
+    last_update_sec: float
+    hit_count: int
+    missed_count: int
+    state: str
+
+    def to_detection(self) -> RackDetection:
+        return RackDetection(
+            detection_id=self.track_id,
+            class_id=self.class_id,
+            class_name=self.class_name,
+            confidence=self.confidence,
+            center_x=self.center_x,
+            center_y=self.center_y,
+            center_z=self.center_z,
+            yaw=self.yaw,
+            length=self.length,
+            width=self.width,
+            height=self.height,
+            corners_xy=self.corners_xy,
+            track_state=self.state,
+            hit_count=self.hit_count,
+            missed_count=self.missed_count,
+        )
+
+
+class TrackStabilizer:
+    STATE_TENTATIVE = "tentative"
+    STATE_CONFIRMED = "confirmed"
+    STATE_LOST = "lost"
+    STATE_DELETED = "deleted"
+
+    def __init__(
+        self,
+        match_distance_m: float,
+        yaw_gate_deg: float,
+        min_iou: float,
+        max_match_cost: float,
+        confirm_hits: int,
+        instant_confirm_confidence: float,
+        max_missed_sec: float,
+        tentative_timeout_sec: float,
+        position_alpha: float,
+        yaw_alpha: float,
+        confidence_alpha: float,
+    ) -> None:
+        self.match_distance_m = float(match_distance_m)
+        self.yaw_gate_rad = math.radians(float(yaw_gate_deg))
+        self.min_iou = float(min_iou)
+        self.max_match_cost = float(max_match_cost)
+        self.confirm_hits = max(int(confirm_hits), 1)
+        self.instant_confirm_confidence = float(instant_confirm_confidence)
+        self.max_missed_sec = float(max_missed_sec)
+        self.tentative_timeout_sec = float(tentative_timeout_sec)
+        self.position_alpha = float(np.clip(position_alpha, 0.0, 1.0))
+        self.yaw_alpha = float(np.clip(yaw_alpha, 0.0, 1.0))
+        self.confidence_alpha = float(np.clip(confidence_alpha, 0.0, 1.0))
+
+        self.tracks: list[RackTrack] = []
+        self.next_track_id = 1
+
+    def update(self, detections: list[RackDetection], now_sec: float) -> list[RackDetection]:
+        active_track_indices = [
+            index for index, track in enumerate(self.tracks)
+            if track.state != self.STATE_DELETED
+        ]
+
+        matches = self.match_tracks_to_detections(active_track_indices, detections)
+
+        matched_track_indices = {track_index for track_index, _ in matches}
+        matched_detection_indices = {detection_index for _, detection_index in matches}
+
+        for track_index, detection_index in matches:
+            self.update_matched_track(
+                track=self.tracks[track_index],
+                detection=detections[detection_index],
+                now_sec=now_sec,
+            )
+
+        for track_index in active_track_indices:
+            if track_index not in matched_track_indices:
+                self.update_unmatched_track(self.tracks[track_index], now_sec)
+
+        for detection_index, detection in enumerate(detections):
+            if detection_index not in matched_detection_indices:
+                self.create_track(detection, now_sec)
+
+        self.remove_deleted_tracks()
+        return self.get_publishable_detections()
+
+    def match_tracks_to_detections(
+        self,
+        active_track_indices: list[int],
+        detections: list[RackDetection],
+    ) -> list[tuple[int, int]]:
+        pair_costs: list[tuple[float, int, int]] = []
+
+        for track_index in active_track_indices:
+            track = self.tracks[track_index]
+
+            for detection_index, detection in enumerate(detections):
+                cost = self.compute_match_cost(track, detection)
+
+                if cost is not None and cost <= self.max_match_cost:
+                    pair_costs.append((cost, track_index, detection_index))
+
+        pair_costs.sort(key=lambda value: value[0])
+
+        matches: list[tuple[int, int]] = []
+        used_tracks: set[int] = set()
+        used_detections: set[int] = set()
+
+        for _, track_index, detection_index in pair_costs:
+            if track_index in used_tracks or detection_index in used_detections:
+                continue
+
+            matches.append((track_index, detection_index))
+            used_tracks.add(track_index)
+            used_detections.add(detection_index)
+
+        return matches
+
+    def compute_match_cost(self, track: RackTrack, detection: RackDetection) -> Optional[float]:
+        distance = math.hypot(
+            detection.center_x - track.center_x,
+            detection.center_y - track.center_y,
+        )
+
+        yaw_difference = abs(self.normalize_angle(detection.yaw - track.yaw))
+        iou = self.oriented_iou_from_corners(track.corners_xy, detection.corners_xy)
+
+        distance_gate_ok = distance <= self.match_distance_m
+        yaw_gate_ok = yaw_difference <= self.yaw_gate_rad
+        iou_gate_ok = iou >= self.min_iou
+
+        if not ((distance_gate_ok and yaw_gate_ok) or iou_gate_ok):
+            return None
+
+        distance_cost = distance / max(self.match_distance_m, 1e-6)
+        yaw_cost = yaw_difference / max(self.yaw_gate_rad, 1e-6)
+        iou_cost = 1.0 - iou
+        class_penalty = 0.0 if detection.class_id == track.class_id else 0.65
+
+        return distance_cost + 0.25 * yaw_cost + 0.50 * iou_cost + class_penalty
+
+    def update_matched_track(self, track: RackTrack, detection: RackDetection, now_sec: float) -> None:
+        track.center_x = self.ema(track.center_x, detection.center_x, self.position_alpha)
+        track.center_y = self.ema(track.center_y, detection.center_y, self.position_alpha)
+        track.center_z = self.ema(track.center_z, detection.center_z, self.position_alpha)
+        track.yaw = self.smooth_angle(track.yaw, detection.yaw, self.yaw_alpha)
+        track.confidence = self.ema(track.confidence, detection.confidence, self.confidence_alpha)
+
+        if self.should_switch_class(track, detection):
+            track.class_id = detection.class_id
+            track.class_name = detection.class_name
+
+        track.length = detection.length
+        track.width = detection.width
+        track.height = detection.height
+        track.corners_xy = self.smoothed_corners(track, detection)
+
+        track.hit_count += 1
+        track.missed_count = 0
+        track.last_seen_sec = now_sec
+        track.last_update_sec = now_sec
+
+        if track.hit_count >= self.confirm_hits or detection.confidence >= self.instant_confirm_confidence:
+            track.state = self.STATE_CONFIRMED
+        elif track.state == self.STATE_LOST:
+            track.state = self.STATE_CONFIRMED
+
+    def update_unmatched_track(self, track: RackTrack, now_sec: float) -> None:
+        track.missed_count += 1
+        track.last_update_sec = now_sec
+
+        seconds_since_seen = now_sec - track.last_seen_sec
+        age_sec = now_sec - track.first_seen_sec
+
+        if track.state == self.STATE_TENTATIVE:
+            if age_sec > self.tentative_timeout_sec or track.missed_count > 1:
+                track.state = self.STATE_DELETED
+            return
+
+        if seconds_since_seen > self.max_missed_sec:
+            track.state = self.STATE_DELETED
+            return
+
+        track.state = self.STATE_LOST
+
+    def create_track(self, detection: RackDetection, now_sec: float) -> None:
+        state = self.STATE_TENTATIVE
+
+        if self.confirm_hits <= 1 or detection.confidence >= self.instant_confirm_confidence:
+            state = self.STATE_CONFIRMED
+
+        track = RackTrack(
+            track_id=self.next_track_id,
+            class_id=detection.class_id,
+            class_name=detection.class_name,
+            confidence=detection.confidence,
+            center_x=detection.center_x,
+            center_y=detection.center_y,
+            center_z=detection.center_z,
+            yaw=detection.yaw,
+            length=detection.length,
+            width=detection.width,
+            height=detection.height,
+            corners_xy=detection.corners_xy,
+            first_seen_sec=now_sec,
+            last_seen_sec=now_sec,
+            last_update_sec=now_sec,
+            hit_count=1,
+            missed_count=0,
+            state=state,
+        )
+
+        self.next_track_id += 1
+        self.tracks.append(track)
+
+    def remove_deleted_tracks(self) -> None:
+        self.tracks = [
+            track for track in self.tracks
+            if track.state != self.STATE_DELETED
+        ]
+
+    def get_publishable_detections(self) -> list[RackDetection]:
+        publishable_tracks = [
+            track for track in self.tracks
+            if track.state in (self.STATE_CONFIRMED, self.STATE_LOST)
+        ]
+
+        publishable_tracks.sort(key=lambda track: track.track_id)
+        return [track.to_detection() for track in publishable_tracks]
+
+    def should_switch_class(self, track: RackTrack, detection: RackDetection) -> bool:
+        if detection.class_id == track.class_id:
+            return False
+
+        if track.state != self.STATE_CONFIRMED:
+            return True
+
+        return detection.confidence >= max(0.45, track.confidence + 0.10)
+
+    def smoothed_corners(self, track: RackTrack, detection: RackDetection) -> list[list[float]]:
+        track_corners = np.asarray(track.corners_xy, dtype=np.float32).reshape(4, 2)
+        detection_corners = np.asarray(detection.corners_xy, dtype=np.float32).reshape(4, 2)
+
+        if track_corners.shape != detection_corners.shape:
+            return detection.corners_xy
+
+        smoothed = (1.0 - self.position_alpha) * track_corners + self.position_alpha * detection_corners
+        return smoothed.astype(float).tolist()
+
+    def oriented_iou_from_corners(self, corners_a: list[list[float]], corners_b: list[list[float]]) -> float:
+        points_a = np.asarray(corners_a, dtype=np.float32).reshape(4, 2)
+        points_b = np.asarray(corners_b, dtype=np.float32).reshape(4, 2)
+
+        area_a = abs(float(cv2.contourArea(points_a)))
+        area_b = abs(float(cv2.contourArea(points_b)))
+
+        if area_a <= 1e-6 or area_b <= 1e-6:
+            return 0.0
+
+        rect_a = cv2.minAreaRect(points_a)
+        rect_b = cv2.minAreaRect(points_b)
+
+        intersection_type, intersection_points = cv2.rotatedRectangleIntersection(rect_a, rect_b)
+
+        if intersection_type == cv2.INTERSECT_NONE or intersection_points is None:
+            return 0.0
+
+        intersection_area = abs(float(cv2.contourArea(intersection_points.astype(np.float32))))
+        union_area = area_a + area_b - intersection_area
+
+        if union_area <= 1e-6:
+            return 0.0
+
+        return intersection_area / union_area
+
+    def ema(self, old_value: float, new_value: float, alpha: float) -> float:
+        return (1.0 - alpha) * old_value + alpha * new_value
+
+    def smooth_angle(self, old_angle: float, new_angle: float, alpha: float) -> float:
+        difference = self.normalize_angle(new_angle - old_angle)
+        return self.normalize_angle(old_angle + alpha * difference)
+
+    def normalize_angle(self, angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+
+class PointCloudReader:
+    @staticmethod
+    def to_xyz_array(msg: PointCloud2) -> np.ndarray:
+        if hasattr(point_cloud2, "read_points_numpy"):
+            try:
+                points = point_cloud2.read_points_numpy(
+                    msg,
+                    field_names=("x", "y", "z"),
+                    skip_nans=True,
+                )
+
+                if isinstance(points, np.ndarray):
+                    if points.dtype.names:
+                        xyz = np.vstack((points["x"], points["y"], points["z"])).T
+                    else:
+                        xyz = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+
+                    return PointCloudReader.filter_finite_xyz(xyz)
+            except Exception:
+                pass
+
+        points_iter = point_cloud2.read_points(
+            msg,
+            field_names=("x", "y", "z"),
+            skip_nans=True,
+        )
+
+        xyz = np.asarray([[point[0], point[1], point[2]] for point in points_iter], dtype=np.float32)
+        return PointCloudReader.filter_finite_xyz(xyz)
+
+    @staticmethod
+    def filter_finite_xyz(points: np.ndarray) -> np.ndarray:
+        if points.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        finite_mask = np.all(np.isfinite(points), axis=1)
+        return points[finite_mask]
+
+
+class BevImageBuilder:
+    def __init__(self, geometry: BevGeometry, density_clip_count: int) -> None:
+        self.geometry = geometry
+        self.density_clip_count = max(int(density_clip_count), 1)
+
+    def build(self, points_xyz: np.ndarray) -> tuple[np.ndarray, dict]:
+        u_values, v_values, filtered_points = self.geometry.points_to_pixels(points_xyz)
+
+        occupancy = np.zeros((self.geometry.height_px, self.geometry.width_px), dtype=np.uint8)
+        height_image = np.zeros_like(occupancy)
+        density_counts = np.zeros((self.geometry.height_px, self.geometry.width_px), dtype=np.uint16)
+
+        if filtered_points.size == 0:
+            image = np.dstack((occupancy, height_image, occupancy))
+            return image, self.build_stats(points_xyz, filtered_points, occupancy, density_counts)
+
+        occupancy[v_values, u_values] = 255
+        np.add.at(density_counts, (v_values, u_values), 1)
+
+        z_min = float(self.geometry.roi_min[2])
+        z_max = float(self.geometry.roi_max[2])
+        z_range = max(z_max - z_min, 1e-6)
+
+        z_normalized = np.clip(((filtered_points[:, 2] - z_min) / z_range) * 255.0, 0.0, 255.0).astype(np.uint8)
+        np.maximum.at(height_image, (v_values, u_values), z_normalized)
+
+        density_normalized = np.clip(
+            (np.log1p(density_counts.astype(np.float32)) / math.log1p(self.density_clip_count)) * 255.0,
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+
+        image = np.dstack((occupancy, height_image, density_normalized))
+        return image, self.build_stats(points_xyz, filtered_points, occupancy, density_counts)
+
+    def build_stats(
+        self,
+        raw_points: np.ndarray,
+        filtered_points: np.ndarray,
+        occupancy: np.ndarray,
+        density_counts: np.ndarray,
+    ) -> dict:
+        return {
+            "points_raw": int(raw_points.shape[0]),
+            "points_in_roi": int(filtered_points.shape[0]),
+            "occupied_pixels": int(np.count_nonzero(occupancy)),
+            "max_density_per_pixel": int(density_counts.max()) if density_counts.size else 0,
+        }
+
+
+class TilePlanner:
+    def __init__(self, tile_size_px: int, overlap_ratio: float) -> None:
+        self.tile_size_px = int(tile_size_px)
+        self.overlap_ratio = float(overlap_ratio)
+
+        if self.tile_size_px <= 0:
+            raise ValueError("tile_size_px muss größer 0 sein.")
+
+        if self.overlap_ratio < 0.0 or self.overlap_ratio >= 1.0:
+            raise ValueError("tile_overlap_ratio muss im Bereich [0.0, 1.0) liegen.")
+
+    def create_windows(self, image_width: int, image_height: int) -> list[TileWindow]:
+        step = max(int(round(self.tile_size_px * (1.0 - self.overlap_ratio))), 1)
+
+        x_starts = self.compute_starts(image_width, self.tile_size_px, step)
+        y_starts = self.compute_starts(image_height, self.tile_size_px, step)
+
+        return [
+            TileWindow(x_min=x_start, y_min=y_start, size=self.tile_size_px)
+            for y_start in y_starts
+            for x_start in x_starts
+        ]
+
+    def compute_starts(self, image_size: int, tile_size: int, step: int) -> list[int]:
+        if image_size <= tile_size:
+            return [0]
+
+        starts = list(range(0, image_size - tile_size + 1, step))
+        final_start = image_size - tile_size
+
+        if not starts or starts[-1] != final_start:
+            starts.append(final_start)
+
+        return starts
+
+
+class ClassThresholdFilter:
+    def __init__(
+        self,
+        side_confidence_threshold: float,
+        top_confidence_threshold: float,
+    ) -> None:
+        self.side_confidence_threshold = float(side_confidence_threshold)
+        self.top_confidence_threshold = float(top_confidence_threshold)
+
+    def keep(self, candidate: DetectionCandidate) -> bool:
+        if candidate.class_id == 0:
+            return candidate.confidence >= self.side_confidence_threshold
+
+        if candidate.class_id == 1:
+            return candidate.confidence >= self.top_confidence_threshold
+
+        return False
+
+
+class OrientedBoxNms:
+    def __init__(self, iou_threshold: float) -> None:
+        self.iou_threshold = float(iou_threshold)
+
+    def apply(self, candidates: list[DetectionCandidate]) -> list[DetectionCandidate]:
+        final_candidates: list[DetectionCandidate] = []
+
+        for class_id in sorted(set(candidate.class_id for candidate in candidates)):
+            class_candidates = [candidate for candidate in candidates if candidate.class_id == class_id]
+            final_candidates.extend(self.apply_single_class(class_candidates))
+
+        return sorted(final_candidates, key=lambda candidate: candidate.confidence, reverse=True)
+
+    def apply_single_class(self, candidates: list[DetectionCandidate]) -> list[DetectionCandidate]:
+        sorted_candidates = sorted(candidates, key=lambda candidate: candidate.confidence, reverse=True)
+        kept: list[DetectionCandidate] = []
+
+        while sorted_candidates:
+            current = sorted_candidates.pop(0)
+            kept.append(current)
+
+            remaining: list[DetectionCandidate] = []
+
+            for candidate in sorted_candidates:
+                iou = self.oriented_iou(current.pixel_corners, candidate.pixel_corners)
+
+                if iou < self.iou_threshold:
+                    remaining.append(candidate)
+
+            sorted_candidates = remaining
+
+        return kept
+
+    def oriented_iou(self, points_a: np.ndarray, points_b: np.ndarray) -> float:
+        area_a = abs(float(cv2.contourArea(points_a.astype(np.float32))))
+        area_b = abs(float(cv2.contourArea(points_b.astype(np.float32))))
+
+        if area_a <= 1e-6 or area_b <= 1e-6:
+            return 0.0
+
+        rect_a = cv2.minAreaRect(points_a.astype(np.float32))
+        rect_b = cv2.minAreaRect(points_b.astype(np.float32))
+
+        intersection_type, intersection_points = cv2.rotatedRectangleIntersection(rect_a, rect_b)
+
+        if intersection_type == cv2.INTERSECT_NONE or intersection_points is None:
+            return 0.0
+
+        intersection_area = abs(float(cv2.contourArea(intersection_points.astype(np.float32))))
+        union_area = area_a + area_b - intersection_area
+
+        if union_area <= 1e-6:
+            return 0.0
+
+        return intersection_area / union_area
+
+
+class PhysicalRackDeduplicator:
+    def __init__(
+        self,
+        enabled: bool,
+        geometry: BevGeometry,
+        merge_distance_m: float,
+        merge_iou_threshold: float,
+        prefer_side_visible: bool,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.geometry = geometry
+        self.merge_distance_m = float(merge_distance_m)
+        self.merge_iou_threshold = float(merge_iou_threshold)
+        self.prefer_side_visible = bool(prefer_side_visible)
+
+    def apply(self, candidates: list[DetectionCandidate]) -> list[DetectionCandidate]:
+        if not self.enabled:
+            return candidates
+
+        sorted_candidates = sorted(
+            candidates,
+            key=self.sort_key,
+        )
+
+        kept: list[DetectionCandidate] = []
+
+        for candidate in sorted_candidates:
+            if self.is_duplicate_of_kept(candidate, kept):
+                continue
+
+            kept.append(candidate)
+
+        return sorted(kept, key=lambda candidate: candidate.confidence, reverse=True)
+
+    def sort_key(self, candidate: DetectionCandidate) -> tuple[int, float]:
+        if self.prefer_side_visible:
+            class_priority = 0 if candidate.class_id == 0 else 1
+        else:
+            class_priority = 0
+
+        return (class_priority, -candidate.confidence)
+
+    def is_duplicate_of_kept(
+        self,
+        candidate: DetectionCandidate,
+        kept_candidates: list[DetectionCandidate],
+    ) -> bool:
+        for kept in kept_candidates:
+            if self.is_same_physical_rack(candidate, kept):
+                return True
+
+        return False
+
+    def is_same_physical_rack(
+        self,
+        candidate_a: DetectionCandidate,
+        candidate_b: DetectionCandidate,
+    ) -> bool:
+        center_a = self.center(candidate_a.pixel_corners)
+        center_b = self.center(candidate_b.pixel_corners)
+
+        distance_px = float(np.linalg.norm(center_a - center_b))
+        distance_m = distance_px * self.geometry.resolution_m_per_px
+
+        if distance_m <= self.merge_distance_m:
+            return True
+
+        iou = self.oriented_iou(candidate_a.pixel_corners, candidate_b.pixel_corners)
+        return iou >= self.merge_iou_threshold
+
+    def center(self, pixel_corners: np.ndarray) -> np.ndarray:
+        return np.mean(np.asarray(pixel_corners, dtype=np.float32).reshape(4, 2), axis=0)
+
+    def oriented_iou(self, points_a: np.ndarray, points_b: np.ndarray) -> float:
+        points_a = np.asarray(points_a, dtype=np.float32).reshape(4, 2)
+        points_b = np.asarray(points_b, dtype=np.float32).reshape(4, 2)
+
+        area_a = abs(float(cv2.contourArea(points_a)))
+        area_b = abs(float(cv2.contourArea(points_b)))
+
+        if area_a <= 1e-6 or area_b <= 1e-6:
+            return 0.0
+
+        rect_a = cv2.minAreaRect(points_a)
+        rect_b = cv2.minAreaRect(points_b)
+
+        intersection_type, intersection_points = cv2.rotatedRectangleIntersection(rect_a, rect_b)
+
+        if intersection_type == cv2.INTERSECT_NONE or intersection_points is None:
+            return 0.0
+
+        intersection_area = abs(float(cv2.contourArea(intersection_points.astype(np.float32))))
+        union_area = area_a + area_b - intersection_area
+
+        if union_area <= 1e-6:
+            return 0.0
+
+        return intersection_area / union_area
+
+
+class RackDetectionConverter:
+    CLASS_NAMES = {
+        0: "rack_side_visible",
+        1: "rack_top_visible",
+    }
+
+    def __init__(
+        self,
+        geometry: BevGeometry,
+        marker_size: list[float],
+        rack_floor_z: float,
+        marker_yaw_mode: str,
+        marker_fixed_yaw_rad: float,
+        marker_yaw_snap_step_deg: float,
+        marker_yaw_snap_offset_deg: float,
+    ) -> None:
+        self.geometry = geometry
+        self.marker_length = float(marker_size[0])
+        self.marker_width = float(marker_size[1])
+        self.marker_height = float(marker_size[2])
+        self.rack_floor_z = float(rack_floor_z)
+        self.marker_yaw_mode = str(marker_yaw_mode).strip().lower()
+        self.marker_fixed_yaw_rad = float(marker_fixed_yaw_rad)
+        self.marker_yaw_snap_step_rad = math.radians(float(marker_yaw_snap_step_deg))
+        self.marker_yaw_snap_offset_rad = math.radians(float(marker_yaw_snap_offset_deg))
+
+    def convert(
+        self,
+        detection_id: int,
+        candidate: DetectionCandidate,
+    ) -> RackDetection:
+        pixel_corners = np.asarray(candidate.pixel_corners, dtype=np.float32).reshape(4, 2)
+        world_corners = self.geometry.pixel_to_world_xy(pixel_corners)
+
+        center_xy = np.mean(world_corners, axis=0)
+        yaw = self.normalize_marker_yaw(self.compute_yaw(world_corners))
+
+        return RackDetection(
+            detection_id=detection_id,
+            class_id=candidate.class_id,
+            class_name=candidate.class_name,
+            confidence=float(candidate.confidence),
+            center_x=float(center_xy[0]),
+            center_y=float(center_xy[1]),
+            center_z=float(self.rack_floor_z + self.marker_height * 0.5),
+            yaw=float(yaw),
+            length=self.marker_length,
+            width=self.marker_width,
+            height=self.marker_height,
+            corners_xy=world_corners.astype(float).tolist(),
+            track_state="raw",
+            hit_count=1,
+            missed_count=0,
+        )
+
+    def compute_yaw(self, world_corners: np.ndarray) -> float:
+        if world_corners.shape != (4, 2):
+            return 0.0
+
+        edge_01 = world_corners[1] - world_corners[0]
+        edge_12 = world_corners[2] - world_corners[1]
+
+        len_01 = float(np.linalg.norm(edge_01))
+        len_12 = float(np.linalg.norm(edge_12))
+
+        edge = edge_01 if len_01 >= len_12 else edge_12
+
+        if float(np.linalg.norm(edge)) < 1e-6:
+            return 0.0
+
+        return math.atan2(float(edge[1]), float(edge[0]))
+
+    def normalize_marker_yaw(self, yaw: float) -> float:
+        if self.marker_yaw_mode == "fixed":
+            return self.normalize_angle(self.marker_fixed_yaw_rad)
+
+        if self.marker_yaw_mode == "snap":
+            return self.snap_yaw(yaw)
+
+        return self.normalize_angle(yaw)
+
+    def snap_yaw(self, yaw: float) -> float:
+        if self.marker_yaw_snap_step_rad <= 1e-6:
+            return self.normalize_angle(yaw)
+
+        shifted = yaw - self.marker_yaw_snap_offset_rad
+        snapped = round(shifted / self.marker_yaw_snap_step_rad) * self.marker_yaw_snap_step_rad
+        return self.normalize_angle(snapped + self.marker_yaw_snap_offset_rad)
+
+    def normalize_angle(self, angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+
+class MarkerFactory:
+    def __init__(
+        self,
+        output_frame: str,
+        marker_alpha: float,
+        text_marker_enabled: bool,
+    ) -> None:
+        self.output_frame = output_frame
+        self.marker_alpha = float(marker_alpha)
+        self.text_marker_enabled = bool(text_marker_enabled)
+
+    def build_marker_array(self, detections: list[RackDetection], stamp) -> MarkerArray:
+        marker_array = MarkerArray()
+        marker_array.markers.append(self.build_delete_all_marker(stamp))
+
+        for detection in detections:
+            marker_array.markers.append(self.build_cube_marker(detection, stamp))
+
+            if self.text_marker_enabled:
+                marker_array.markers.append(self.build_text_marker(detection, stamp))
+
+        return marker_array
+
+    def build_delete_all_marker(self, stamp) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = self.output_frame
+        marker.header.stamp = stamp
+        marker.ns = "rack_yolo_obb"
+        marker.id = 0
+        marker.action = Marker.DELETEALL
+        return marker
+
+    def build_cube_marker(self, detection: RackDetection, stamp) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = self.output_frame
+        marker.header.stamp = stamp
+        marker.ns = "rack_yolo_obb"
+        marker.id = detection.detection_id
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = detection.center_x
+        marker.pose.position.y = detection.center_y
+        marker.pose.position.z = detection.center_z
+        marker.pose.orientation.z = math.sin(detection.yaw * 0.5)
+        marker.pose.orientation.w = math.cos(detection.yaw * 0.5)
+
+        marker.scale.x = detection.length
+        marker.scale.y = detection.width
+        marker.scale.z = detection.height
+
+        if detection.class_id == 0:
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+        else:
+            marker.color.r = 1.0
+            marker.color.g = 0.65
+            marker.color.b = 0.0
+
+        if detection.track_state == "lost":
+            marker.color.a = self.marker_alpha * 0.45
+        else:
+            marker.color.a = self.marker_alpha
+
+        return marker
+
+    def build_text_marker(self, detection: RackDetection, stamp) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = self.output_frame
+        marker.header.stamp = stamp
+        marker.ns = "rack_yolo_obb_text"
+        marker.id = 10000 + detection.detection_id
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = detection.center_x
+        marker.pose.position.y = detection.center_y
+        marker.pose.position.z = detection.center_z + detection.height * 0.6
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.z = 0.35
+        marker.color.r = 1.0
+        marker.color.g = 1.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+
+        marker.text = (
+            f"id {detection.detection_id} "
+            f"{detection.class_name} "
+            f"{detection.track_state} "
+            f"{detection.confidence:.2f}"
+        )
+        return marker
+
+
+class DetectionMessageBuilder:
+    @staticmethod
+    def to_pose_array(detections: list[RackDetection], frame_id: str, stamp) -> PoseArray:
+        pose_array = PoseArray()
+        pose_array.header.frame_id = frame_id
+        pose_array.header.stamp = stamp
+
+        for detection in detections:
+            pose = Pose()
+            pose.position.x = detection.center_x
+            pose.position.y = detection.center_y
+            pose.position.z = detection.center_z
+            pose.orientation.z = math.sin(detection.yaw * 0.5)
+            pose.orientation.w = math.cos(detection.yaw * 0.5)
+            pose_array.poses.append(pose)
+
+        return pose_array
+
+    @staticmethod
+    def to_json_string(detections: list[RackDetection], frame_id: str, stamp, stats: dict) -> String:
+        message = String()
+
+        payload = {
+            "frame_id": frame_id,
+            "stamp": {
+                "sec": int(stamp.sec),
+                "nanosec": int(stamp.nanosec),
+            },
+            "stats": stats,
+            "detections": [
+                {
+                    "id": detection.detection_id,
+                    "class_id": detection.class_id,
+                    "class_name": detection.class_name,
+                    "confidence": detection.confidence,
+                    "center": {
+                        "x": detection.center_x,
+                        "y": detection.center_y,
+                        "z": detection.center_z,
+                    },
+                    "yaw": detection.yaw,
+                    "size": {
+                        "length": detection.length,
+                        "width": detection.width,
+                        "height": detection.height,
+                    },
+                    "corners_xy": detection.corners_xy,
+                    "track": {
+                        "state": detection.track_state,
+                        "hit_count": detection.hit_count,
+                        "missed_count": detection.missed_count,
+                    },
+                }
+                for detection in detections
+            ],
+        }
+
+        message.data = json.dumps(payload, ensure_ascii=False)
+        return message
+
+
+class YoloObbBevDetectorNode(Node):
+    def __init__(self) -> None:
+        super().__init__("yolo_obb_bev_detector_node")
+
+        if YOLO is None:
+            raise RuntimeError(
+                "Ultralytics konnte nicht importiert werden. "
+                f"Ursache: {YOLO_IMPORT_ERROR}"
+            )
+
+        self.declare_node_parameters()
+        self.load_parameters()
+        self.initialize_model()
+
+        self.bev_builder = BevImageBuilder(
+            geometry=self.geometry,
+            density_clip_count=self.density_clip_count,
+        )
+        self.tile_planner = TilePlanner(
+            tile_size_px=self.tile_size_px,
+            overlap_ratio=self.tile_overlap_ratio,
+        )
+        self.threshold_filter = ClassThresholdFilter(
+            side_confidence_threshold=self.side_confidence_threshold,
+            top_confidence_threshold=self.top_confidence_threshold,
+        )
+        self.obb_nms = OrientedBoxNms(
+            iou_threshold=self.obb_nms_iou_threshold,
+        )
+        self.physical_deduplicator = PhysicalRackDeduplicator(
+            enabled=self.deduplicate_physical_racks,
+            geometry=self.geometry,
+            merge_distance_m=self.physical_merge_distance_m,
+            merge_iou_threshold=self.physical_merge_iou_threshold,
+            prefer_side_visible=self.physical_prefer_side_visible,
+        )
+        self.detection_converter = RackDetectionConverter(
+            geometry=self.geometry,
+            marker_size=self.marker_size,
+            rack_floor_z=self.rack_floor_z,
+            marker_yaw_mode=self.marker_yaw_mode,
+            marker_fixed_yaw_rad=self.marker_fixed_yaw_rad,
+            marker_yaw_snap_step_deg=self.marker_yaw_snap_step_deg,
+            marker_yaw_snap_offset_deg=self.marker_yaw_snap_offset_deg,
+        )
+        self.track_stabilizer = TrackStabilizer(
+            match_distance_m=self.track_match_distance_m,
+            yaw_gate_deg=self.track_yaw_gate_deg,
+            min_iou=self.track_min_iou,
+            max_match_cost=self.track_max_match_cost,
+            confirm_hits=self.track_confirm_hits,
+            instant_confirm_confidence=self.track_instant_confirm_confidence,
+            max_missed_sec=self.track_max_missed_sec,
+            tentative_timeout_sec=self.track_tentative_timeout_sec,
+            position_alpha=self.track_position_alpha,
+            yaw_alpha=self.track_yaw_alpha,
+            confidence_alpha=self.track_confidence_alpha,
+        )
+        self.marker_factory = MarkerFactory(
+            output_frame=self.output_frame,
+            marker_alpha=self.marker_alpha,
+            text_marker_enabled=self.text_marker_enabled,
+        )
+
+        self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 10)
+        self.centroid_pub = self.create_publisher(PoseArray, self.centroid_topic, 10)
+        self.json_pub = self.create_publisher(String, self.json_topic, 10)
+
+        self.tracking_centroid_pub = None
+        if self.publish_tracking_centroids:
+            self.tracking_centroid_pub = self.create_publisher(PoseArray, "/tracking/cluster_centroids", 10)
+
+        self.subscription = self.create_subscription(
+            PointCloud2,
+            self.input_topic,
+            self.handle_cloud,
+            qos_profile_sensor_data,
+        )
+
+        self.last_inference_time_sec: Optional[float] = None
+        self.received_count = 0
+        self.inference_count = 0
+
+        self.get_logger().info("yolo_obb_bev_detector_node started.")
+        self.get_logger().info(f"Input topic: {self.input_topic}")
+        self.get_logger().info(f"Expected frame_id: {self.expected_frame_id}")
+        self.get_logger().info(f"Output frame: {self.output_frame}")
+        self.get_logger().info(f"Model path: {self.model_path}")
+        self.get_logger().info(f"ROI min: {self.geometry.roi_min.tolist()}")
+        self.get_logger().info(f"ROI max: {self.geometry.roi_max.tolist()}")
+        self.get_logger().info(
+            f"BEV image: {self.geometry.width_px}x{self.geometry.height_px} px "
+            f"@ {self.geometry.resolution_m_per_px:.4f} m/px"
+        )
+        self.get_logger().info(
+            f"Sliding window: tile_size_px={self.tile_size_px}, "
+            f"tile_overlap_ratio={self.tile_overlap_ratio}, imgsz={self.imgsz}"
+        )
+        self.get_logger().info(
+            f"Thresholds: model_conf={self.model_confidence_threshold}, "
+            f"side_conf={self.side_confidence_threshold}, "
+            f"top_conf={self.top_confidence_threshold}, "
+            f"obb_nms_iou={self.obb_nms_iou_threshold}"
+        )
+        self.get_logger().info(
+            f"Physical dedup: enabled={self.deduplicate_physical_racks}, "
+            f"merge_distance={self.physical_merge_distance_m:.2f}m, "
+            f"merge_iou={self.physical_merge_iou_threshold:.2f}, "
+            f"prefer_side={self.physical_prefer_side_visible}"
+        )
+        self.get_logger().info(
+            f"MOT-Light: enabled={self.track_enabled}, "
+            f"match_distance={self.track_match_distance_m:.2f}m, "
+            f"yaw_gate={self.track_yaw_gate_deg:.1f}deg, "
+            f"confirm_hits={self.track_confirm_hits}, "
+            f"max_missed_sec={self.track_max_missed_sec:.1f}"
+        )
+        self.get_logger().info(
+            f"Marker yaw: mode={self.marker_yaw_mode}, "
+            f"fixed_yaw_rad={self.marker_fixed_yaw_rad:.4f}, "
+            f"snap_step_deg={self.marker_yaw_snap_step_deg:.1f}, "
+            f"snap_offset_deg={self.marker_yaw_snap_offset_deg:.1f}"
+        )
+        self.get_logger().info(f"Marker topic: {self.marker_topic}")
+        self.get_logger().info(f"Centroid topic: {self.centroid_topic}")
+        self.get_logger().info(f"JSON topic: {self.json_topic}")
+
+    def declare_node_parameters(self) -> None:
+        self.declare_parameter("input_topic", "/rslidar_points")
+        self.declare_parameter("expected_frame_id", "rslidar")
+        self.declare_parameter("output_frame", "rslidar")
+
+        self.declare_parameter(
+            "model_path",
+            "/home/edv/ros2_ws/bev_dataset/models/rack_bev_obb_yolo26m_v4m_racksv2_best_epoch40.pt",
+        )
+
+        self.declare_parameter("roi_min", [-14.5, -15.0, -2.0])
+        self.declare_parameter("roi_max", [9.0, 6.0, 3.0])
+        self.declare_parameter("resolution_m_per_px", 0.01)
+
+        self.declare_parameter("density_clip_count", 12)
+        self.declare_parameter("min_points_in_roi", 1000)
+
+        self.declare_parameter("inference_interval_sec", 1.0)
+        self.declare_parameter("imgsz", 1024)
+        self.declare_parameter("model_confidence_threshold", 0.03)
+        self.declare_parameter("confidence_threshold", 0.03)
+        self.declare_parameter("iou_threshold", 0.50)
+        self.declare_parameter("device", "0")
+
+        self.declare_parameter("tile_size_px", 1024)
+        self.declare_parameter("tile_overlap_ratio", 0.25)
+        self.declare_parameter("side_confidence_threshold", 0.20)
+        self.declare_parameter("top_confidence_threshold", 0.05)
+        self.declare_parameter("obb_nms_iou_threshold", 0.20)
+
+        self.declare_parameter("deduplicate_physical_racks", True)
+        self.declare_parameter("physical_merge_distance_m", 0.45)
+        self.declare_parameter("physical_merge_iou_threshold", 0.05)
+        self.declare_parameter("physical_prefer_side_visible", True)
+
+        self.declare_parameter("marker_size", [1.05, 1.05, 2.00])
+        self.declare_parameter("marker_yaw_mode", "fixed")
+        self.declare_parameter("marker_fixed_yaw_rad", 0.0)
+        self.declare_parameter("marker_yaw_snap_step_deg", 90.0)
+        self.declare_parameter("marker_yaw_snap_offset_deg", 0.0)
+        self.declare_parameter("rack_floor_z", -0.95)
+        self.declare_parameter("marker_alpha", 0.35)
+        self.declare_parameter("text_marker_enabled", True)
+
+        self.declare_parameter("track_enabled", True)
+        self.declare_parameter("track_match_distance_m", 0.50)
+        self.declare_parameter("track_yaw_gate_deg", 45.0)
+        self.declare_parameter("track_min_iou", 0.02)
+        self.declare_parameter("track_max_match_cost", 2.40)
+        self.declare_parameter("track_confirm_hits", 2)
+        self.declare_parameter("track_instant_confirm_confidence", 0.45)
+        self.declare_parameter("track_max_missed_sec", 8.0)
+        self.declare_parameter("track_tentative_timeout_sec", 3.0)
+        self.declare_parameter("track_position_alpha", 0.25)
+        self.declare_parameter("track_yaw_alpha", 0.20)
+        self.declare_parameter("track_confidence_alpha", 0.35)
+
+        self.declare_parameter("marker_topic", "/detection/rack_obb_markers")
+        self.declare_parameter("centroid_topic", "/detection/rack_centroids")
+        self.declare_parameter("json_topic", "/detection/rack_detections_json")
+        self.declare_parameter("publish_tracking_centroids", False)
+
+    def load_parameters(self) -> None:
+        self.input_topic = str(self.get_parameter("input_topic").value)
+        self.expected_frame_id = str(self.get_parameter("expected_frame_id").value).strip()
+        self.output_frame = str(self.get_parameter("output_frame").value).strip()
+
+        self.model_path = str(Path(str(self.get_parameter("model_path").value)).expanduser())
+
+        roi_min = [float(value) for value in self.get_parameter("roi_min").value]
+        roi_max = [float(value) for value in self.get_parameter("roi_max").value]
+        resolution_m_per_px = float(self.get_parameter("resolution_m_per_px").value)
+
+        self.geometry = BevGeometry.from_values(
+            roi_min=roi_min,
+            roi_max=roi_max,
+            resolution_m_per_px=resolution_m_per_px,
+        )
+
+        self.density_clip_count = int(self.get_parameter("density_clip_count").value)
+        self.min_points_in_roi = int(self.get_parameter("min_points_in_roi").value)
+
+        self.inference_interval_sec = float(self.get_parameter("inference_interval_sec").value)
+        self.imgsz = int(self.get_parameter("imgsz").value)
+        self.model_confidence_threshold = float(self.get_parameter("model_confidence_threshold").value)
+        self.confidence_threshold = float(self.get_parameter("confidence_threshold").value)
+        self.iou_threshold = float(self.get_parameter("iou_threshold").value)
+        self.device = str(self.get_parameter("device").value)
+
+        self.tile_size_px = int(self.get_parameter("tile_size_px").value)
+        self.tile_overlap_ratio = float(self.get_parameter("tile_overlap_ratio").value)
+        self.side_confidence_threshold = float(self.get_parameter("side_confidence_threshold").value)
+        self.top_confidence_threshold = float(self.get_parameter("top_confidence_threshold").value)
+        self.obb_nms_iou_threshold = float(self.get_parameter("obb_nms_iou_threshold").value)
+
+        self.deduplicate_physical_racks = bool(self.get_parameter("deduplicate_physical_racks").value)
+        self.physical_merge_distance_m = float(self.get_parameter("physical_merge_distance_m").value)
+        self.physical_merge_iou_threshold = float(self.get_parameter("physical_merge_iou_threshold").value)
+        self.physical_prefer_side_visible = bool(self.get_parameter("physical_prefer_side_visible").value)
+
+        self.marker_size = [float(value) for value in self.get_parameter("marker_size").value]
+        self.marker_yaw_mode = str(self.get_parameter("marker_yaw_mode").value)
+        self.marker_fixed_yaw_rad = float(self.get_parameter("marker_fixed_yaw_rad").value)
+        self.marker_yaw_snap_step_deg = float(self.get_parameter("marker_yaw_snap_step_deg").value)
+        self.marker_yaw_snap_offset_deg = float(self.get_parameter("marker_yaw_snap_offset_deg").value)
+        self.rack_floor_z = float(self.get_parameter("rack_floor_z").value)
+        self.marker_alpha = float(self.get_parameter("marker_alpha").value)
+        self.text_marker_enabled = bool(self.get_parameter("text_marker_enabled").value)
+
+        self.track_enabled = bool(self.get_parameter("track_enabled").value)
+        self.track_match_distance_m = float(self.get_parameter("track_match_distance_m").value)
+        self.track_yaw_gate_deg = float(self.get_parameter("track_yaw_gate_deg").value)
+        self.track_min_iou = float(self.get_parameter("track_min_iou").value)
+        self.track_max_match_cost = float(self.get_parameter("track_max_match_cost").value)
+        self.track_confirm_hits = int(self.get_parameter("track_confirm_hits").value)
+        self.track_instant_confirm_confidence = float(self.get_parameter("track_instant_confirm_confidence").value)
+        self.track_max_missed_sec = float(self.get_parameter("track_max_missed_sec").value)
+        self.track_tentative_timeout_sec = float(self.get_parameter("track_tentative_timeout_sec").value)
+        self.track_position_alpha = float(self.get_parameter("track_position_alpha").value)
+        self.track_yaw_alpha = float(self.get_parameter("track_yaw_alpha").value)
+        self.track_confidence_alpha = float(self.get_parameter("track_confidence_alpha").value)
+
+        self.marker_topic = str(self.get_parameter("marker_topic").value)
+        self.centroid_topic = str(self.get_parameter("centroid_topic").value)
+        self.json_topic = str(self.get_parameter("json_topic").value)
+        self.publish_tracking_centroids = bool(self.get_parameter("publish_tracking_centroids").value)
+
+    def initialize_model(self) -> None:
+        model_file = Path(self.model_path)
+
+        if not model_file.exists():
+            raise FileNotFoundError(f"YOLO-Modell nicht gefunden: {model_file}")
+
+        self.model = YOLO(str(model_file))
+
+    def handle_cloud(self, msg: PointCloud2) -> None:
+        self.received_count += 1
+
+        if self.expected_frame_id and msg.header.frame_id != self.expected_frame_id:
+            if self.received_count <= 5:
+                self.get_logger().warn(
+                    f"Skipping cloud with frame_id={msg.header.frame_id!r}; "
+                    f"expected {self.expected_frame_id!r}."
+                )
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        if self.last_inference_time_sec is not None:
+            if now_sec - self.last_inference_time_sec < self.inference_interval_sec:
+                return
+
+        self.last_inference_time_sec = now_sec
+
+        points_xyz = PointCloudReader.to_xyz_array(msg)
+        bev_image, stats = self.bev_builder.build(points_xyz)
+
+        if stats["points_in_roi"] < self.min_points_in_roi:
+            self.get_logger().warn(
+                f"Skipping inference: only {stats['points_in_roi']} ROI points "
+                f"(min_points_in_roi={self.min_points_in_roi})."
+            )
+            self.publish_empty(msg.header.stamp, stats)
+            return
+
+        raw_detections = self.run_inference(bev_image)
+        self.inference_count += 1
+
+        if self.track_enabled:
+            detections = self.track_stabilizer.update(raw_detections, now_sec)
+        else:
+            detections = raw_detections
+
+        stats["raw_detections"] = len(raw_detections)
+        stats["published_detections"] = len(detections)
+        stats["active_tracks"] = len(self.track_stabilizer.tracks) if self.track_enabled else 0
+
+        self.publish_detections(detections, msg.header.stamp, stats)
+
+        side_count = sum(1 for detection in detections if detection.class_id == 0)
+        top_count = sum(1 for detection in detections if detection.class_id == 1)
+        confirmed_count = sum(1 for detection in detections if detection.track_state == "confirmed")
+        lost_count = sum(1 for detection in detections if detection.track_state == "lost")
+
+        self.get_logger().info(
+            f"Inference #{self.inference_count}: raw={len(raw_detections)}, "
+            f"published={len(detections)}, confirmed={confirmed_count}, lost={lost_count}, "
+            f"side={side_count}, top={top_count}, "
+            f"points_in_roi={stats['points_in_roi']}, occupied_pixels={stats['occupied_pixels']}"
+        )
+
+    def run_inference(self, bev_image: np.ndarray) -> list[RackDetection]:
+        image_height, image_width = bev_image.shape[:2]
+        windows = self.tile_planner.create_windows(image_width, image_height)
+
+        raw_candidates: list[DetectionCandidate] = []
+
+        for window in windows:
+            tile = bev_image[window.y_min:window.y_max, window.x_min:window.x_max]
+
+            if tile.shape[0] != self.tile_size_px or tile.shape[1] != self.tile_size_px:
+                continue
+
+            results = self.model.predict(
+                source=tile,
+                imgsz=self.imgsz,
+                conf=self.model_confidence_threshold,
+                iou=self.iou_threshold,
+                device=self.device,
+                verbose=False,
+            )
+
+            if not results:
+                continue
+
+            raw_candidates.extend(self.extract_candidates_from_result(results[0], window))
+
+        threshold_candidates = [
+            candidate for candidate in raw_candidates
+            if self.threshold_filter.keep(candidate)
+        ]
+
+        nms_candidates = self.obb_nms.apply(threshold_candidates)
+        final_candidates = self.physical_deduplicator.apply(nms_candidates)
+
+        detections: list[RackDetection] = []
+
+        for index, candidate in enumerate(final_candidates, start=1):
+            detections.append(
+                self.detection_converter.convert(
+                    detection_id=index,
+                    candidate=candidate,
+                )
+            )
+
+        return detections
+
+    def extract_candidates_from_result(self, result, window: TileWindow) -> list[DetectionCandidate]:
+        if result.obb is None:
+            return []
+
+        if result.obb.xyxyxyxy is None:
+            return []
+
+        pixel_boxes = result.obb.xyxyxyxy.cpu().numpy()
+        confidences = result.obb.conf.cpu().numpy() if result.obb.conf is not None else np.ones(len(pixel_boxes))
+        classes = result.obb.cls.cpu().numpy() if result.obb.cls is not None else np.zeros(len(pixel_boxes))
+
+        candidates: list[DetectionCandidate] = []
+
+        for index, pixel_box in enumerate(pixel_boxes):
+            class_id = int(classes[index])
+
+            if class_id not in (0, 1):
+                continue
+
+            pixel_corners = np.asarray(pixel_box, dtype=np.float32).reshape(4, 2)
+            pixel_corners[:, 0] += window.x_min
+            pixel_corners[:, 1] += window.y_min
+
+            class_name = RackDetectionConverter.CLASS_NAMES.get(class_id, f"class_{class_id}")
+
+            candidates.append(
+                DetectionCandidate(
+                    class_id=class_id,
+                    class_name=class_name,
+                    confidence=float(confidences[index]),
+                    pixel_corners=pixel_corners,
+                    source_tile=window,
+                )
+            )
+
+        return candidates
+
+    def publish_empty(self, stamp, stats: dict) -> None:
+        self.publish_detections([], stamp, stats)
+
+    def publish_detections(self, detections: list[RackDetection], stamp, stats: dict) -> None:
+        marker_array = self.marker_factory.build_marker_array(detections, stamp)
+        pose_array = DetectionMessageBuilder.to_pose_array(detections, self.output_frame, stamp)
+        json_message = DetectionMessageBuilder.to_json_string(detections, self.output_frame, stamp, stats)
+
+        self.marker_pub.publish(marker_array)
+        self.centroid_pub.publish(pose_array)
+        self.json_pub.publish(json_message)
+
+        if self.tracking_centroid_pub is not None:
+            self.tracking_centroid_pub.publish(pose_array)
+
+
+def main(args: Optional[list[str]] = None) -> None:
+    rclpy.init(args=args)
+
+    node = YoloObbBevDetectorNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

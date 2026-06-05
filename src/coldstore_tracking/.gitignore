@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+yolo_obb_venv/
+
+# ROS2 workspace artifacts
+build/
+install/
+log/
+
+# Local editor files
+.vscode/settings.json
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime logs
+*.log
+*.tmp
+
+# Large ML / dataset artifacts
+*.pt
+*.onnx
+*.engine
+*.npz
+*.bag
+*.db3
+
+# BEV datasets and generated outputs
+bev_dataset/
+runs/
+predictions/
+candidates_empty_bev_review/
+cvat_exports/
+label_previews/
+
+# Generated images / labels if accidentally copied into repo
+raw/
+images/
+labels/
+
+# Backups created during patching
+*.bak
+*.bak_*
+*_backup_*

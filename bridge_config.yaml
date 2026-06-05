@@ -1,0 +1,75 @@
+- ros_topic_name: "/lidar_01/points"
+  gz_topic_name: "/lidar_01/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/lidar_02/points"
+  gz_topic_name: "/lidar_02/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/lidar_03/points"
+  gz_topic_name: "/lidar_03/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/lidar_04/points"
+  gz_topic_name: "/lidar_04/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/lidar_05/points"
+  gz_topic_name: "/lidar_05/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/lidar_06/points"
+  gz_topic_name: "/lidar_06/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+# LiDARs (wie gehabt)
+# ...
+
+# Kameras (Images)
+- ros_topic_name: "/cam_in/image"
+  gz_topic_name: "/cam_in/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cam_out_1/image"
+  gz_topic_name: "/cam_out_1/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cam_out_2/image"
+  gz_topic_name: "/cam_out_2/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# Kamera Informationen (Wichtig für RViz Camera View)
+- ros_topic_name: "/cam_in/camera_info"
+  gz_topic_name: "/cam_in/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cam_out_1/camera_info"
+  gz_topic_name: "/cam_out_1/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+  
+- ros_topic_name: "/cam_out_2/camera_info"
+  gz_topic_name: "/cam_out_2/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS

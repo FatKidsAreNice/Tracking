@@ -1,0 +1,128 @@
+cloud_transform_merge_node:
+  ros__parameters:
+    mode: single
+    target_frame: world
+    publish_rate_hz: 10.0
+    voxel_size: 0.04
+    merged_voxel_size: 0.04
+    stale_cloud_timeout_sec: 0.6
+    input_topic: /rslidar_points
+    expected_frame_id: rslidar
+    sensor_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    roi_min: [-2.15,  -1.00,  -0.80]
+    roi_max: [-0.80,  1.05,  1.20]
+
+cluster_detector_node:
+  ros__parameters:
+    target_frame: world
+    detection_mode: background_subtraction
+
+    voxel_size: 0.06
+    keep_largest_cluster_only: false
+    oriented_marker_use_fixed_size: true
+    oriented_marker_fixed_size: [1.30, 1.30, 2.00]
+    oriented_marker_center_mode: top_footprint
+    top_footprint_z_keep_ratio: 0.25
+    top_footprint_bounds_quantile: 0.05
+    top_footprint_min_points: 20
+    top_footprint_z_center_mode: measured_mid
+    oriented_marker_yaw_mode: visible_edge
+    visible_edge_keep_ratio: 0.30
+    visible_edge_sensor_position: [0.0, 0.0, 0.0]
+    object_center_smoothing_enabled: false
+    object_center_smoothing_alpha: 0.15
+    object_center_max_step: 0.08
+    oriented_marker_yaw_smoothing_enabled: false
+    oriented_marker_yaw_smoothing_alpha: 0.20
+    publish_oriented_cluster_markers: true
+    oriented_marker_min_voxels: 10
+    oriented_marker_min_scale: 0.02
+    oriented_marker_pca_keep_ratio: 0.90
+    oriented_marker_bounds_quantile: 0.03
+    oriented_marker_min_inlier_points: 20
+
+    min_cluster_voxels: 20
+    max_cluster_voxels: 50000
+    min_cluster_size: [0.80, 0.80, 0.05]
+    max_cluster_size: [3.00, 3.20, 2.80]
+    min_cluster_height: -2.50
+    max_cluster_height: 1.30
+
+    publish_only_clustered_dynamic: false
+
+    background_capture_duration_sec: 20.0
+    background_min_occupancy_ratio: 0.35
+    background_expansion_voxels: 2
+    background_expansion_axes: [1, 1, 1]
+    publish_only_clustered_dynamic: false
+
+    # Touched-Fallback:
+    # Darf großzügiger sein, aber erzeugt keine sichtbaren Marker
+    # und keine neuen Tracks. Er stabilisiert nur vorhandene Tracks.
+    allow_touched_clusters: true
+    touched_min_cluster_voxels: 90
+    touched_max_cluster_voxels: 35000
+    touched_min_cluster_size: [0.25, 0.20, 0.04]
+    touched_max_cluster_size: [2.80, 2.20, 2.40]
+    publish_touched_markers: false
+
+    # Einzel-Footprints bleiben aus, damit Rauschcluster nicht projiziert werden.
+    allow_footprint_projection: false
+    footprint_min_cluster_voxels: 300
+    footprint_max_cluster_voxels: 20000
+    footprint_min_size: [0.60, 0.60, 0.02]
+    footprint_max_size: [1.10, 1.10, 0.50]
+    footprint_min_height: 0.50
+    footprint_max_height: 2.00
+    projection_floor_z: -0.50
+    projection_height: 1.30
+    publish_footprint_markers: false
+
+    # Pair-Modus bleibt streng.
+    # Das ist der Grund, warum Menschen aktuell nicht als Regal erkannt werden.
+    allow_paired_clusters: true
+
+    pair_min_lower_cluster_voxels: 180
+    pair_max_lower_cluster_voxels: 16000
+    pair_min_upper_cluster_voxels: 180
+    pair_max_upper_cluster_voxels: 20000
+
+    pair_min_lower_size: [0.50, 0.50, 0.01]
+    pair_max_lower_size: [1.20, 1.20, 0.95]
+
+    pair_min_upper_size: [0.45, 0.45, 0.01]
+    pair_max_upper_size: [1.20, 1.20, 0.90]
+
+    # Etwas lockerer, damit untere und obere Box verheiratet werden.
+    pair_lower_min_height: -0.70
+    pair_lower_max_height: 0.75
+    pair_upper_min_height: 0.35
+    pair_upper_max_height: 2.20
+
+    # Z-Abstand lockern, XY-Zusammengehörigkeit aber streng lassen.
+    pair_min_z_separation: 0.25
+    pair_max_z_separation: 2.10
+    pair_max_xy_center_distance: 0.30
+    pair_min_xy_overlap_ratio: 0.60
+
+    pair_project_to_rack_height: true
+    pair_projection_floor_z: 0.0
+    pair_projection_height: 1.60
+    publish_pair_markers: true
+
+track_manager_node:
+  ros__parameters:
+    target_frame: world
+
+    # Normaler Pair-/Regal-Match.
+    max_match_distance: 1.00
+
+    # Track nicht sofort löschen, wenn Pair kurz durch Hand/Arm ungültig wird.
+    max_missed_updates: 100
+
+    # Touched-Fallback:
+    # Darf vorhandene Tracks weiterführen, aber keine neuen erzeugen.
+    touched_match_distance: 1.80
+    touched_update_alpha: 0.25
+    create_tracks_from_touched: false
