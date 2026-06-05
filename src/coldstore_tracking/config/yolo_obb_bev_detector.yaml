@@ -41,6 +41,7 @@ yolo_obb_bev_detector_node:
     rack_floor_z: -0.95
     marker_alpha: 0.35
     text_marker_enabled: true
+    marker_lifetime_sec: 2.5
 
     track_enabled: true
     track_match_distance_m: 0.50
@@ -58,5 +59,15 @@ yolo_obb_bev_detector_node:
     marker_topic: /detection/rack_obb_markers
     centroid_topic: /detection/rack_centroids
     json_topic: /detection/rack_detections_json
+    stable_track_topic: /tracking/stable_tracks
+    publish_stable_tracks: true
+    stable_track_include_lost: true
 
     publish_tracking_centroids: false
+
+track_manager_node:
+  ros__parameters:
+    target_frame: rslidar
+    use_stable_tracks_input: true
+    stable_track_topic: /tracking/stable_tracks
+    stable_track_include_lost: true

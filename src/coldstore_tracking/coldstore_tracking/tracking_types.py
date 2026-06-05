@@ -21,3 +21,14 @@ class Track:
     missed_updates: int
     last_stamp_sec: float
     barcode_id: str = ''
+    class_id: int = -1
+    class_name: str = ''
+    state: str = 'confirmed'
+    confidence: float = 0.0
+    yaw: float = 0.0
+    length: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+    hit_count: int = 0
+    source_missed_count: int = 0
+    frame_id: str = ''

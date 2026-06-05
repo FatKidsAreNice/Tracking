@@ -22,24 +22,38 @@ def parse_string_message(msg: String) -> Dict[str, Any]:
 
 def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
+    frame_id = ''
 
     for track in sorted(tracks.values(), key=lambda item: item.track_id):
+        if not frame_id and track.frame_id:
+            frame_id = str(track.frame_id)
         items.append({
             'track_id': int(track.track_id),
             'barcode_id': str(track.barcode_id),
+            'class_id': int(track.class_id),
+            'class_name': str(track.class_name),
+            'state': str(track.state),
+            'confidence': float(track.confidence),
             'x': float(track.centroid[0]),
             'y': float(track.centroid[1]),
             'z': float(track.centroid[2]),
+            'yaw': float(track.yaw),
+            'length': float(track.length),
+            'width': float(track.width),
+            'height': float(track.height),
             'vx': float(track.velocity[0]),
             'vy': float(track.velocity[1]),
             'vz': float(track.velocity[2]),
             'age': int(track.age),
+            'hit_count': int(track.hit_count),
             'missed_updates': int(track.missed_updates),
+            'source_missed_count': int(track.source_missed_count),
             'last_stamp_sec': float(track.last_stamp_sec),
         })
 
     return {
         'stamp_sec': float(stamp_sec),
+        'frame_id': frame_id,
         'tracks': items,
     }
 

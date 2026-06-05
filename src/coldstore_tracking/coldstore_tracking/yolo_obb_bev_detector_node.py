@@ -10,6 +10,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import rclpy
+from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose, PoseArray
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -857,30 +858,52 @@ class MarkerFactory:
         output_frame: str,
         marker_alpha: float,
         text_marker_enabled: bool,
+        marker_lifetime_sec: float,
     ) -> None:
         self.output_frame = output_frame
         self.marker_alpha = float(marker_alpha)
         self.text_marker_enabled = bool(text_marker_enabled)
+        self.marker_lifetime_sec = max(float(marker_lifetime_sec), 0.0)
 
     def build_marker_array(self, detections: list[RackDetection], stamp) -> MarkerArray:
         marker_array = MarkerArray()
-        marker_array.markers.append(self.build_delete_all_marker(stamp))
+        marker_array.markers.extend(self.build_delete_all_markers(stamp))
 
         for detection in detections:
             marker_array.markers.append(self.build_cube_marker(detection, stamp))
 
-            if self.text_marker_enabled:
+            if self.should_publish_text_marker(detection):
                 marker_array.markers.append(self.build_text_marker(detection, stamp))
 
         return marker_array
 
-    def build_delete_all_marker(self, stamp) -> Marker:
+    def build_delete_all_markers(self, stamp) -> list[Marker]:
+        return [
+            self.build_delete_all_marker("rack_yolo_obb", stamp),
+            self.build_delete_all_marker("rack_yolo_obb_text", stamp),
+        ]
+
+    def build_delete_all_marker(self, namespace: str, stamp) -> Marker:
         marker = Marker()
         marker.header.frame_id = self.output_frame
         marker.header.stamp = stamp
-        marker.ns = "rack_yolo_obb"
+        marker.ns = namespace
         marker.id = 0
         marker.action = Marker.DELETEALL
+        return marker
+
+    def should_publish_text_marker(self, detection: RackDetection) -> bool:
+        return self.text_marker_enabled and detection.track_state != "lost"
+
+    def apply_lifetime(self, marker: Marker) -> Marker:
+        lifetime_sec = int(self.marker_lifetime_sec)
+        lifetime_nanosec = int(round((self.marker_lifetime_sec - lifetime_sec) * 1e9))
+
+        if lifetime_nanosec >= 1_000_000_000:
+            lifetime_sec += 1
+            lifetime_nanosec -= 1_000_000_000
+
+        marker.lifetime = Duration(sec=lifetime_sec, nanosec=lifetime_nanosec)
         return marker
 
     def build_cube_marker(self, detection: RackDetection, stamp) -> Marker:
@@ -916,7 +939,7 @@ class MarkerFactory:
         else:
             marker.color.a = self.marker_alpha
 
-        return marker
+        return self.apply_lifetime(marker)
 
     def build_text_marker(self, detection: RackDetection, stamp) -> Marker:
         marker = Marker()
@@ -944,7 +967,7 @@ class MarkerFactory:
             f"{detection.track_state} "
             f"{detection.confidence:.2f}"
         )
-        return marker
+        return self.apply_lifetime(marker)
 
 
 class DetectionMessageBuilder:
@@ -1002,6 +1025,55 @@ class DetectionMessageBuilder:
                 }
                 for detection in detections
             ],
+        }
+
+        message.data = json.dumps(payload, ensure_ascii=False)
+        return message
+
+    @staticmethod
+    def to_stable_tracks_json_string(
+        detections: list[RackDetection],
+        frame_id: str,
+        stamp,
+        include_lost_tracks: bool,
+    ) -> String:
+        message = String()
+
+        tracks = []
+        for detection in detections:
+            if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
+                continue
+            if detection.track_state == TrackStabilizer.STATE_LOST and not include_lost_tracks:
+                continue
+            if detection.track_state not in (TrackStabilizer.STATE_CONFIRMED, TrackStabilizer.STATE_LOST):
+                continue
+
+            tracks.append(
+                {
+                    "track_id": int(detection.detection_id),
+                    "class_id": int(detection.class_id),
+                    "class_name": detection.class_name,
+                    "state": detection.track_state,
+                    "confidence": float(detection.confidence),
+                    "center_x": float(detection.center_x),
+                    "center_y": float(detection.center_y),
+                    "center_z": float(detection.center_z),
+                    "yaw": float(detection.yaw),
+                    "length": float(detection.length),
+                    "width": float(detection.width),
+                    "height": float(detection.height),
+                    "hit_count": int(detection.hit_count),
+                    "missed_count": int(detection.missed_count),
+                }
+            )
+
+        payload = {
+            "frame_id": frame_id,
+            "stamp": {
+                "sec": int(stamp.sec),
+                "nanosec": int(stamp.nanosec),
+            },
+            "tracks": tracks,
         }
 
         message.data = json.dumps(payload, ensure_ascii=False)
@@ -1070,11 +1142,15 @@ class YoloObbBevDetectorNode(Node):
             output_frame=self.output_frame,
             marker_alpha=self.marker_alpha,
             text_marker_enabled=self.text_marker_enabled,
+            marker_lifetime_sec=self.marker_lifetime_sec,
         )
 
         self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 10)
         self.centroid_pub = self.create_publisher(PoseArray, self.centroid_topic, 10)
         self.json_pub = self.create_publisher(String, self.json_topic, 10)
+        self.stable_track_pub = None
+        if self.publish_stable_tracks:
+            self.stable_track_pub = self.create_publisher(String, self.stable_track_topic, 10)
 
         self.tracking_centroid_pub = None
         if self.publish_tracking_centroids:
@@ -1131,6 +1207,15 @@ class YoloObbBevDetectorNode(Node):
             f"snap_step_deg={self.marker_yaw_snap_step_deg:.1f}, "
             f"snap_offset_deg={self.marker_yaw_snap_offset_deg:.1f}"
         )
+        self.get_logger().info(
+            f"Marker config: alpha={self.marker_alpha:.2f}, "
+            f"text_enabled={self.text_marker_enabled}, "
+            f"lifetime_sec={self.marker_lifetime_sec:.2f}"
+        )
+        self.get_logger().info(
+            f"Stable track output: enabled={self.publish_stable_tracks}, "
+            f"topic={self.stable_track_topic}, include_lost={self.stable_track_include_lost}"
+        )
         self.get_logger().info(f"Marker topic: {self.marker_topic}")
         self.get_logger().info(f"Centroid topic: {self.centroid_topic}")
         self.get_logger().info(f"JSON topic: {self.json_topic}")
@@ -1178,6 +1263,7 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("rack_floor_z", -0.95)
         self.declare_parameter("marker_alpha", 0.35)
         self.declare_parameter("text_marker_enabled", True)
+        self.declare_parameter("marker_lifetime_sec", 2.5)
 
         self.declare_parameter("track_enabled", True)
         self.declare_parameter("track_match_distance_m", 0.50)
@@ -1195,6 +1281,9 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("marker_topic", "/detection/rack_obb_markers")
         self.declare_parameter("centroid_topic", "/detection/rack_centroids")
         self.declare_parameter("json_topic", "/detection/rack_detections_json")
+        self.declare_parameter("stable_track_topic", "/tracking/stable_tracks")
+        self.declare_parameter("publish_stable_tracks", True)
+        self.declare_parameter("stable_track_include_lost", True)
         self.declare_parameter("publish_tracking_centroids", False)
 
     def load_parameters(self) -> None:
@@ -1243,6 +1332,7 @@ class YoloObbBevDetectorNode(Node):
         self.rack_floor_z = float(self.get_parameter("rack_floor_z").value)
         self.marker_alpha = float(self.get_parameter("marker_alpha").value)
         self.text_marker_enabled = bool(self.get_parameter("text_marker_enabled").value)
+        self.marker_lifetime_sec = float(self.get_parameter("marker_lifetime_sec").value)
 
         self.track_enabled = bool(self.get_parameter("track_enabled").value)
         self.track_match_distance_m = float(self.get_parameter("track_match_distance_m").value)
@@ -1260,6 +1350,9 @@ class YoloObbBevDetectorNode(Node):
         self.marker_topic = str(self.get_parameter("marker_topic").value)
         self.centroid_topic = str(self.get_parameter("centroid_topic").value)
         self.json_topic = str(self.get_parameter("json_topic").value)
+        self.stable_track_topic = str(self.get_parameter("stable_track_topic").value)
+        self.publish_stable_tracks = bool(self.get_parameter("publish_stable_tracks").value)
+        self.stable_track_include_lost = bool(self.get_parameter("stable_track_include_lost").value)
         self.publish_tracking_centroids = bool(self.get_parameter("publish_tracking_centroids").value)
 
     def initialize_model(self) -> None:
@@ -1420,6 +1513,14 @@ class YoloObbBevDetectorNode(Node):
         self.marker_pub.publish(marker_array)
         self.centroid_pub.publish(pose_array)
         self.json_pub.publish(json_message)
+        if self.stable_track_pub is not None:
+            stable_track_message = DetectionMessageBuilder.to_stable_tracks_json_string(
+                detections=detections,
+                frame_id=self.output_frame,
+                stamp=stamp,
+                include_lost_tracks=self.stable_track_include_lost,
+            )
+            self.stable_track_pub.publish(stable_track_message)
 
         if self.tracking_centroid_pub is not None:
             self.tracking_centroid_pub.publish(pose_array)

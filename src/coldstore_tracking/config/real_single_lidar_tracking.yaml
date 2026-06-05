@@ -114,6 +114,9 @@ cluster_detector_node:
 track_manager_node:
   ros__parameters:
     target_frame: world
+    use_stable_tracks_input: false
+    stable_track_topic: /tracking/stable_tracks
+    stable_track_include_lost: true
 
     # Normaler Pair-/Regal-Match.
     max_match_distance: 1.00

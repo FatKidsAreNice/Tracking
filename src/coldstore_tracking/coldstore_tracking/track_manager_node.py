@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from builtin_interfaces.msg import Time
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -24,6 +25,9 @@ class TrackManagerNode(Node):
         self.declare_parameter('touched_update_alpha', 0.55)
         self.declare_parameter('max_missed_updates', 80)
         self.declare_parameter('create_tracks_from_touched', False)
+        self.declare_parameter('use_stable_tracks_input', False)
+        self.declare_parameter('stable_track_topic', '/tracking/stable_tracks')
+        self.declare_parameter('stable_track_include_lost', True)
 
         self.target_frame = str(self.get_parameter('target_frame').value)
         self.max_match_distance = float(self.get_parameter('max_match_distance').value)
@@ -31,24 +35,39 @@ class TrackManagerNode(Node):
         self.touched_update_alpha = float(self.get_parameter('touched_update_alpha').value)
         self.max_missed_updates = int(self.get_parameter('max_missed_updates').value)
         self.create_tracks_from_touched = bool(self.get_parameter('create_tracks_from_touched').value)
+        self.use_stable_tracks_input = bool(self.get_parameter('use_stable_tracks_input').value)
+        self.stable_track_topic = str(self.get_parameter('stable_track_topic').value)
+        self.stable_track_include_lost = bool(self.get_parameter('stable_track_include_lost').value)
 
         self.tracks: Dict[int, Track] = {}
         self.next_track_id = 1
         self.last_stamp_sec = 0.0
         self.last_stamp_msg = None
+        self.last_source_frame_id = ''
 
-        self.centroid_sub = self.create_subscription(
-            PoseArray,
-            '/tracking/cluster_centroids',
-            self.centroid_callback,
-            10,
-        )
-        self.touched_centroid_sub = self.create_subscription(
-            PoseArray,
-            '/tracking/touched_cluster_centroids',
-            self.touched_centroid_callback,
-            10,
-        )
+        self.centroid_sub = None
+        self.touched_centroid_sub = None
+        self.stable_track_sub = None
+        if self.use_stable_tracks_input:
+            self.stable_track_sub = self.create_subscription(
+                String,
+                self.stable_track_topic,
+                self.stable_track_callback,
+                10,
+            )
+        else:
+            self.centroid_sub = self.create_subscription(
+                PoseArray,
+                '/tracking/cluster_centroids',
+                self.centroid_callback,
+                10,
+            )
+            self.touched_centroid_sub = self.create_subscription(
+                PoseArray,
+                '/tracking/touched_cluster_centroids',
+                self.touched_centroid_callback,
+                10,
+            )
         self.assignment_sub = self.create_subscription(
             String,
             '/tracking/id_assignments',
@@ -72,6 +91,11 @@ class TrackManagerNode(Node):
         )
 
         self.get_logger().info('track_manager_node started.')
+        self.get_logger().info(
+            f'Input mode: stable_tracks={self.use_stable_tracks_input}, '
+            f'stable_track_topic={self.stable_track_topic}, '
+            f'include_lost={self.stable_track_include_lost}'
+        )
 
     def centroid_callback(self, pose_array: PoseArray) -> None:
         detections = self.pose_array_to_detections(pose_array)
@@ -94,6 +118,24 @@ class TrackManagerNode(Node):
 
         self.update_tracks_with_touched_detections(detections, stamp_sec)
         self.publish_track_markers(pose_array.header.stamp)
+        self.publish_track_states(stamp_sec)
+
+    def stable_track_callback(self, msg: String) -> None:
+        payload = parse_string_message(msg)
+        tracks = payload.get('tracks', [])
+        stamp_data = payload.get('stamp', {})
+        stamp_sec = self.stable_stamp_to_sec(stamp_data)
+        frame_id = str(payload.get('frame_id', '')).strip()
+
+        self.last_stamp_sec = stamp_sec
+        self.last_stamp_msg = Time(
+            sec=int(stamp_data.get('sec', 0)),
+            nanosec=int(stamp_data.get('nanosec', 0)),
+        )
+        self.last_source_frame_id = frame_id
+
+        self.sync_tracks_from_stable_tracks(tracks, stamp_sec, frame_id)
+        self.publish_track_markers(self.last_stamp_msg)
         self.publish_track_states(stamp_sec)
 
     def update_tracks_with_normal_detections(self, detections: List[np.ndarray], stamp_sec: float) -> None:
@@ -182,6 +224,7 @@ class TrackManagerNode(Node):
             missed_updates=0,
             last_stamp_sec=stamp_sec,
             barcode_id='',
+            hit_count=1,
         )
         self.tracks[track.track_id] = track
         self.next_track_id += 1
@@ -194,8 +237,68 @@ class TrackManagerNode(Node):
         track.velocity = (blended_centroid - track.centroid) / dt
         track.centroid = blended_centroid.astype(np.float32)
         track.age += 1
+        track.hit_count = max(track.hit_count + 1, track.age)
         track.missed_updates = 0
+        track.source_missed_count = 0
         track.last_stamp_sec = stamp_sec
+
+    def sync_tracks_from_stable_tracks(self, items: List[dict], stamp_sec: float, frame_id: str) -> None:
+        accepted_tracks: Dict[int, Track] = {}
+
+        for item in items:
+            track_id = int(item.get('track_id', 0))
+            if track_id <= 0:
+                continue
+
+            state = str(item.get('state', '')).strip().lower()
+            if state == 'tentative':
+                continue
+            if state == 'lost' and not self.stable_track_include_lost:
+                continue
+            if state not in ('confirmed', 'lost'):
+                continue
+
+            position = np.array(
+                [
+                    float(item.get('center_x', 0.0)),
+                    float(item.get('center_y', 0.0)),
+                    float(item.get('center_z', 0.0)),
+                ],
+                dtype=np.float32,
+            )
+
+            previous_track = self.tracks.get(track_id)
+            velocity = np.zeros(3, dtype=np.float32)
+            barcode_id = ''
+            if previous_track is not None:
+                dt = max(stamp_sec - previous_track.last_stamp_sec, 1e-3)
+                velocity = ((position - previous_track.centroid) / dt).astype(np.float32)
+                barcode_id = previous_track.barcode_id
+
+            accepted_tracks[track_id] = Track(
+                track_id=track_id,
+                centroid=position,
+                velocity=velocity,
+                age=max(int(item.get('hit_count', 1)), 1),
+                missed_updates=int(item.get('missed_count', 0)),
+                last_stamp_sec=stamp_sec,
+                barcode_id=barcode_id,
+                class_id=int(item.get('class_id', -1)),
+                class_name=str(item.get('class_name', '')),
+                state=state,
+                confidence=float(item.get('confidence', 0.0)),
+                yaw=float(item.get('yaw', 0.0)),
+                length=float(item.get('length', 0.0)),
+                width=float(item.get('width', 0.0)),
+                height=float(item.get('height', 0.0)),
+                hit_count=int(item.get('hit_count', 0)),
+                source_missed_count=int(item.get('missed_count', 0)),
+                frame_id=frame_id,
+            )
+
+        self.tracks = accepted_tracks
+        if self.tracks:
+            self.next_track_id = max(self.next_track_id, max(self.tracks.keys()) + 1)
 
     def assignment_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
@@ -272,10 +375,11 @@ class TrackManagerNode(Node):
         delete_marker.action = Marker.DELETEALL
         marker_array.markers.append(delete_marker)
 
+        marker_frame = self.last_source_frame_id or self.target_frame
         marker_id = 0
         for track in sorted(self.tracks.values(), key=lambda item: item.track_id):
             sphere = Marker()
-            sphere.header.frame_id = self.target_frame
+            sphere.header.frame_id = marker_frame
             sphere.header.stamp = stamp
             sphere.ns = 'tracks'
             sphere.id = marker_id
@@ -289,7 +393,11 @@ class TrackManagerNode(Node):
             sphere.scale.y = 0.25
             sphere.scale.z = 0.25
 
-            if track.missed_updates == 0:
+            if track.state == 'lost':
+                sphere.color.r = 1.0
+                sphere.color.g = 0.8
+                sphere.color.b = 0.0
+            elif track.missed_updates == 0:
                 sphere.color.r = 1.0
                 sphere.color.g = 0.0
                 sphere.color.b = 0.0
@@ -302,7 +410,7 @@ class TrackManagerNode(Node):
             marker_id += 1
 
             text = Marker()
-            text.header.frame_id = self.target_frame
+            text.header.frame_id = marker_frame
             text.header.stamp = stamp
             text.ns = 'track_labels'
             text.id = marker_id
@@ -320,7 +428,11 @@ class TrackManagerNode(Node):
 
             speed = float(np.linalg.norm(track.velocity))
             barcode = track.barcode_id if track.barcode_id else '-'
-            text.text = f'T{track.track_id} id:{barcode} age:{track.age} miss:{track.missed_updates} v:{speed:.2f}m/s'
+            class_label = track.class_name if track.class_name else '-'
+            text.text = (
+                f'T{track.track_id} {track.state} {class_label} id:{barcode} '
+                f'hit:{track.hit_count} miss:{track.source_missed_count} v:{speed:.2f}m/s'
+            )
             marker_array.markers.append(text)
             marker_id += 1
 
@@ -347,6 +459,10 @@ class TrackManagerNode(Node):
         if self.last_stamp_msg is not None:
             return self.last_stamp_msg
         return self.get_clock().now().to_msg()
+
+    @staticmethod
+    def stable_stamp_to_sec(stamp_data: dict) -> float:
+        return float(stamp_data.get('sec', 0)) + float(stamp_data.get('nanosec', 0)) * 1e-9
 
 
 def main(args=None) -> None:
