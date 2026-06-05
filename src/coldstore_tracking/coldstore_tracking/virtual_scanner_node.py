@@ -21,6 +21,8 @@ class ScannerZone:
 
 
 class VirtualScannerNode(Node):
+    SCANNABLE_MOTION_STATES = {'newly_appeared', 'static', 'moving'}
+
     def __init__(self) -> None:
         super().__init__('virtual_scanner_node')
 
@@ -85,13 +87,17 @@ class VirtualScannerNode(Node):
         tracks = payload.get('tracks', [])
         stamp_sec = float(payload.get('stamp_sec', 0.0))
 
-        current_track_ids = {int(item.get('track_id', 0)) for item in tracks}
+        visible_tracks = [
+            item for item in tracks
+            if str(item.get('motion_state', '')) in self.SCANNABLE_MOTION_STATES
+        ]
+        current_track_ids = {int(item.get('track_id', 0)) for item in visible_tracks}
 
         for zone in self.zones:
             stale_ids = {track_id for track_id in self.active_tracks_by_zone[zone.scanner_id] if track_id not in current_track_ids}
             self.active_tracks_by_zone[zone.scanner_id] -= stale_ids
 
-        for item in tracks:
+        for item in visible_tracks:
             track_id = int(item.get('track_id', 0))
             barcode_id = str(item.get('barcode_id', ''))
             centroid = np.array(

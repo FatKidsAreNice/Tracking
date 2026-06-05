@@ -11,6 +11,8 @@ from .event_utils import build_assignment_payload, make_string_message, parse_st
 
 
 class IdAssignmentNode(Node):
+    ASSIGNABLE_MOTION_STATES = {'newly_appeared', 'static', 'moving'}
+
     def __init__(self) -> None:
         super().__init__('id_assignment_node')
 
@@ -180,6 +182,8 @@ class IdAssignmentNode(Node):
             return None
 
         for track_id, track in self.latest_tracks.items():
+            if not self.is_assignable_track(track):
+                continue
             if str(track.get('barcode_id', '')) == barcode_id:
                 return track_id
 
@@ -195,6 +199,8 @@ class IdAssignmentNode(Node):
         best_distance: Optional[float] = None
 
         for track_id, track in self.latest_tracks.items():
+            if not self.is_assignable_track(track):
+                continue
             track_barcode = str(track.get('barcode_id', ''))
 
             if require_empty_barcode and track_barcode:
@@ -221,6 +227,10 @@ class IdAssignmentNode(Node):
                 best_track_id = track_id
 
         return best_track_id
+
+    def is_assignable_track(self, track: Dict) -> bool:
+        motion_state = str(track.get('motion_state', ''))
+        return motion_state in self.ASSIGNABLE_MOTION_STATES
 
 
 def main(args=None) -> None:

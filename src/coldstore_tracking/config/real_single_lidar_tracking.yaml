@@ -117,6 +117,12 @@ track_manager_node:
     use_stable_tracks_input: false
     stable_track_topic: /tracking/stable_tracks
     stable_track_include_lost: true
+    newly_appeared_hold_sec: 1.5
+    motion_static_threshold_m: 0.03
+    motion_moving_threshold_m: 0.12
+    motion_required_updates: 3
+    occluded_timeout_sec: 3.0
+    disappeared_retention_sec: 4.0
 
     # Normaler Pair-/Regal-Match.
     max_match_distance: 1.00

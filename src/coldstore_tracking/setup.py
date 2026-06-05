@@ -25,10 +25,11 @@ setup(
             'cloud_transform_merge_node = coldstore_tracking.cloud_transform_merge_node:main',
             'cluster_detector_node = coldstore_tracking.cluster_detector_node:main',
             'track_manager_node = coldstore_tracking.track_manager_node:main',
+            'track_overview_gui_node = coldstore_tracking.track_overview_gui_node:main',
             'virtual_scanner_node = coldstore_tracking.virtual_scanner_node:main',
             'id_assignment_node = coldstore_tracking.id_assignment_node:main',
             'regal_mover_node = coldstore_tracking.regal_mover_node:main',
-                    'bev_dataset_export_node = coldstore_tracking.bev_dataset_export_node:main',
-],
+            'bev_dataset_export_node = coldstore_tracking.bev_dataset_export_node:main',
+        ],
     },
 )

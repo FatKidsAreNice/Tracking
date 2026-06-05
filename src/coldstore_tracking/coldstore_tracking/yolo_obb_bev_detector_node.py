@@ -14,7 +14,7 @@ from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose, PoseArray
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
@@ -172,6 +172,8 @@ class RackTrack:
     hit_count: int
     missed_count: int
     state: str
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
 
     def to_detection(self) -> RackDetection:
         return RackDetection(
@@ -212,6 +214,14 @@ class TrackStabilizer:
         position_alpha: float,
         yaw_alpha: float,
         confidence_alpha: float,
+        moving_match_distance_m: float,
+        lost_match_distance_m: float,
+        moving_yaw_gate_deg: float,
+        lost_yaw_gate_deg: float,
+        reid_max_distance_m: float,
+        reid_max_size_ratio_delta: float,
+        reid_max_yaw_diff_deg: float,
+        moving_speed_threshold_mps: float,
     ) -> None:
         self.match_distance_m = float(match_distance_m)
         self.yaw_gate_rad = math.radians(float(yaw_gate_deg))
@@ -224,8 +234,17 @@ class TrackStabilizer:
         self.position_alpha = float(np.clip(position_alpha, 0.0, 1.0))
         self.yaw_alpha = float(np.clip(yaw_alpha, 0.0, 1.0))
         self.confidence_alpha = float(np.clip(confidence_alpha, 0.0, 1.0))
+        self.moving_match_distance_m = max(float(moving_match_distance_m), self.match_distance_m)
+        self.lost_match_distance_m = max(float(lost_match_distance_m), self.moving_match_distance_m)
+        self.moving_yaw_gate_rad = math.radians(float(moving_yaw_gate_deg))
+        self.lost_yaw_gate_rad = math.radians(float(lost_yaw_gate_deg))
+        self.reid_max_distance_m = float(reid_max_distance_m)
+        self.reid_max_size_ratio_delta = float(reid_max_size_ratio_delta)
+        self.reid_max_yaw_gate_rad = math.radians(float(reid_max_yaw_diff_deg))
+        self.moving_speed_threshold_mps = float(moving_speed_threshold_mps)
 
         self.tracks: list[RackTrack] = []
+        self.recently_deleted_tracks: list[RackTrack] = []
         self.next_track_id = 1
 
     def update(self, detections: list[RackDetection], now_sec: float) -> list[RackDetection]:
@@ -252,6 +271,8 @@ class TrackStabilizer:
 
         for detection_index, detection in enumerate(detections):
             if detection_index not in matched_detection_indices:
+                if self.try_reidentify_track(detection, now_sec):
+                    continue
                 self.create_track(detection, now_sec)
 
         self.remove_deleted_tracks()
@@ -290,29 +311,36 @@ class TrackStabilizer:
         return matches
 
     def compute_match_cost(self, track: RackTrack, detection: RackDetection) -> Optional[float]:
+        predicted_center_x, predicted_center_y = self.predict_track_xy(track)
         distance = math.hypot(
-            detection.center_x - track.center_x,
-            detection.center_y - track.center_y,
+            detection.center_x - predicted_center_x,
+            detection.center_y - predicted_center_y,
         )
 
         yaw_difference = abs(self.normalize_angle(detection.yaw - track.yaw))
         iou = self.oriented_iou_from_corners(track.corners_xy, detection.corners_xy)
+        match_distance_gate = self.get_match_distance_gate(track)
+        yaw_gate_rad = self.get_yaw_gate_rad(track)
 
-        distance_gate_ok = distance <= self.match_distance_m
-        yaw_gate_ok = yaw_difference <= self.yaw_gate_rad
+        distance_gate_ok = distance <= match_distance_gate
+        yaw_gate_ok = yaw_difference <= yaw_gate_rad
         iou_gate_ok = iou >= self.min_iou
 
         if not ((distance_gate_ok and yaw_gate_ok) or iou_gate_ok):
             return None
 
-        distance_cost = distance / max(self.match_distance_m, 1e-6)
-        yaw_cost = yaw_difference / max(self.yaw_gate_rad, 1e-6)
+        size_cost = self.compute_size_cost(track, detection)
+        distance_cost = distance / max(match_distance_gate, 1e-6)
+        yaw_cost = yaw_difference / max(yaw_gate_rad, 1e-6)
         iou_cost = 1.0 - iou
         class_penalty = 0.0 if detection.class_id == track.class_id else 0.65
 
-        return distance_cost + 0.25 * yaw_cost + 0.50 * iou_cost + class_penalty
+        return distance_cost + 0.25 * yaw_cost + 0.50 * iou_cost + 0.20 * size_cost + class_penalty
 
     def update_matched_track(self, track: RackTrack, detection: RackDetection, now_sec: float) -> None:
+        previous_center_x = track.center_x
+        previous_center_y = track.center_y
+        previous_update_sec = track.last_update_sec
         track.center_x = self.ema(track.center_x, detection.center_x, self.position_alpha)
         track.center_y = self.ema(track.center_y, detection.center_y, self.position_alpha)
         track.center_z = self.ema(track.center_z, detection.center_z, self.position_alpha)
@@ -332,6 +360,11 @@ class TrackStabilizer:
         track.missed_count = 0
         track.last_seen_sec = now_sec
         track.last_update_sec = now_sec
+        dt = max(now_sec - previous_update_sec, 1e-3)
+        measured_velocity_x = (track.center_x - previous_center_x) / dt
+        measured_velocity_y = (track.center_y - previous_center_y) / dt
+        track.velocity_x = self.ema(track.velocity_x, measured_velocity_x, self.position_alpha)
+        track.velocity_y = self.ema(track.velocity_y, measured_velocity_y, self.position_alpha)
 
         if track.hit_count >= self.confirm_hits or detection.confidence >= self.instant_confirm_confidence:
             track.state = self.STATE_CONFIRMED
@@ -381,16 +414,25 @@ class TrackStabilizer:
             hit_count=1,
             missed_count=0,
             state=state,
+            velocity_x=0.0,
+            velocity_y=0.0,
         )
 
         self.next_track_id += 1
         self.tracks.append(track)
 
     def remove_deleted_tracks(self) -> None:
-        self.tracks = [
-            track for track in self.tracks
-            if track.state != self.STATE_DELETED
-        ]
+        active_tracks: list[RackTrack] = []
+        for track in self.tracks:
+            if track.state == self.STATE_DELETED:
+                self.recently_deleted_tracks.append(track)
+            else:
+                active_tracks.append(track)
+        self.tracks = active_tracks
+        latest_update_sec = max(
+            [track.last_update_sec for track in self.tracks] + [track.last_update_sec for track in self.recently_deleted_tracks] + [0.0]
+        )
+        self.prune_recently_deleted_tracks(latest_update_sec)
 
     def get_publishable_detections(self) -> list[RackDetection]:
         publishable_tracks = [
@@ -400,6 +442,109 @@ class TrackStabilizer:
 
         publishable_tracks.sort(key=lambda track: track.track_id)
         return [track.to_detection() for track in publishable_tracks]
+
+    def get_match_distance_gate(self, track: RackTrack) -> float:
+        if track.state == self.STATE_LOST:
+            return self.lost_match_distance_m
+        if self.track_speed(track) >= self.moving_speed_threshold_mps:
+            return self.moving_match_distance_m
+        return self.match_distance_m
+
+    def get_yaw_gate_rad(self, track: RackTrack) -> float:
+        if track.state == self.STATE_LOST:
+            return self.lost_yaw_gate_rad
+        if self.track_speed(track) >= self.moving_speed_threshold_mps:
+            return self.moving_yaw_gate_rad
+        return self.yaw_gate_rad
+
+    def predict_track_xy(self, track: RackTrack) -> tuple[float, float]:
+        dt = max(track.last_update_sec - track.last_seen_sec, 0.0)
+        if track.state != self.STATE_LOST or dt <= 1e-6:
+            return track.center_x, track.center_y
+        return (
+            track.center_x + track.velocity_x * dt,
+            track.center_y + track.velocity_y * dt,
+        )
+
+    def track_speed(self, track: RackTrack) -> float:
+        return math.hypot(track.velocity_x, track.velocity_y)
+
+    def compute_size_cost(self, track: RackTrack, detection: RackDetection) -> float:
+        ratios = []
+        for track_size, detection_size in (
+            (track.length, detection.length),
+            (track.width, detection.width),
+            (track.height, detection.height),
+        ):
+            denominator = max(track_size, detection_size, 1e-6)
+            ratios.append(abs(track_size - detection_size) / denominator)
+        return float(np.mean(ratios))
+
+    def try_reidentify_track(self, detection: RackDetection, now_sec: float) -> bool:
+        best_track: RackTrack | None = None
+        best_cost: float | None = None
+
+        for track in self.recently_deleted_tracks:
+            reid_cost = self.compute_reid_cost(track, detection, now_sec)
+            if reid_cost is None:
+                continue
+            if best_cost is None or reid_cost < best_cost:
+                best_cost = reid_cost
+                best_track = track
+
+        if best_track is None:
+            return False
+
+        self.recently_deleted_tracks = [
+            track for track in self.recently_deleted_tracks
+            if track.track_id != best_track.track_id
+        ]
+        best_track.state = self.STATE_LOST
+        best_track.last_update_sec = now_sec
+        self.tracks.append(best_track)
+        self.update_matched_track(best_track, detection, now_sec)
+        return True
+
+    def compute_reid_cost(self, track: RackTrack, detection: RackDetection, now_sec: float) -> Optional[float]:
+        if detection.class_id != track.class_id:
+            return None
+
+        predicted_center_x, predicted_center_y = self.predict_recent_track_xy(track, now_sec)
+        distance = math.hypot(
+            detection.center_x - predicted_center_x,
+            detection.center_y - predicted_center_y,
+        )
+        if distance > self.reid_max_distance_m:
+            return None
+
+        yaw_difference = abs(self.normalize_angle(detection.yaw - track.yaw))
+        if yaw_difference > self.reid_max_yaw_gate_rad:
+            return None
+
+        size_cost = self.compute_size_cost(track, detection)
+        if size_cost > self.reid_max_size_ratio_delta:
+            return None
+
+        iou = self.oriented_iou_from_corners(track.corners_xy, detection.corners_xy)
+        return (
+            distance / max(self.reid_max_distance_m, 1e-6)
+            + 0.35 * (yaw_difference / max(self.reid_max_yaw_gate_rad, 1e-6))
+            + 0.35 * size_cost / max(self.reid_max_size_ratio_delta, 1e-6)
+            + 0.25 * (1.0 - iou)
+        )
+
+    def predict_recent_track_xy(self, track: RackTrack, now_sec: float) -> tuple[float, float]:
+        dt = max(now_sec - track.last_update_sec, 0.0)
+        return (
+            track.center_x + track.velocity_x * dt,
+            track.center_y + track.velocity_y * dt,
+        )
+
+    def prune_recently_deleted_tracks(self, now_sec: float) -> None:
+        self.recently_deleted_tracks = [
+            track for track in self.recently_deleted_tracks
+            if (now_sec - track.last_update_sec) <= self.max_missed_sec * 2.0
+        ]
 
     def should_switch_class(self, track: RackTrack, detection: RackDetection) -> bool:
         if detection.class_id == track.class_id:
@@ -1079,6 +1224,21 @@ class DetectionMessageBuilder:
         message.data = json.dumps(payload, ensure_ascii=False)
         return message
 
+    @staticmethod
+    def to_bev_image_message(bev_image: np.ndarray, frame_id: str, stamp) -> Image:
+        rgb_image = np.clip(bev_image * 255.0, 0.0, 255.0).astype(np.uint8)
+
+        message = Image()
+        message.header.frame_id = frame_id
+        message.header.stamp = stamp
+        message.height = int(rgb_image.shape[0])
+        message.width = int(rgb_image.shape[1])
+        message.encoding = "rgb8"
+        message.is_bigendian = 0
+        message.step = int(rgb_image.shape[1] * rgb_image.shape[2])
+        message.data = rgb_image.tobytes()
+        return message
+
 
 class YoloObbBevDetectorNode(Node):
     def __init__(self) -> None:
@@ -1137,6 +1297,14 @@ class YoloObbBevDetectorNode(Node):
             position_alpha=self.track_position_alpha,
             yaw_alpha=self.track_yaw_alpha,
             confidence_alpha=self.track_confidence_alpha,
+            moving_match_distance_m=self.track_moving_match_distance_m,
+            lost_match_distance_m=self.track_lost_match_distance_m,
+            moving_yaw_gate_deg=self.track_moving_yaw_gate_deg,
+            lost_yaw_gate_deg=self.track_lost_yaw_gate_deg,
+            reid_max_distance_m=self.track_reid_max_distance_m,
+            reid_max_size_ratio_delta=self.track_reid_max_size_ratio_delta,
+            reid_max_yaw_diff_deg=self.track_reid_max_yaw_diff_deg,
+            moving_speed_threshold_mps=self.track_moving_speed_threshold_mps,
         )
         self.marker_factory = MarkerFactory(
             output_frame=self.output_frame,
@@ -1148,6 +1316,9 @@ class YoloObbBevDetectorNode(Node):
         self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 10)
         self.centroid_pub = self.create_publisher(PoseArray, self.centroid_topic, 10)
         self.json_pub = self.create_publisher(String, self.json_topic, 10)
+        self.bev_image_pub = None
+        if self.publish_bev_image:
+            self.bev_image_pub = self.create_publisher(Image, self.bev_image_topic, 10)
         self.stable_track_pub = None
         if self.publish_stable_tracks:
             self.stable_track_pub = self.create_publisher(String, self.stable_track_topic, 10)
@@ -1197,9 +1368,17 @@ class YoloObbBevDetectorNode(Node):
         self.get_logger().info(
             f"MOT-Light: enabled={self.track_enabled}, "
             f"match_distance={self.track_match_distance_m:.2f}m, "
+            f"moving_match_distance={self.track_moving_match_distance_m:.2f}m, "
+            f"lost_match_distance={self.track_lost_match_distance_m:.2f}m, "
             f"yaw_gate={self.track_yaw_gate_deg:.1f}deg, "
             f"confirm_hits={self.track_confirm_hits}, "
             f"max_missed_sec={self.track_max_missed_sec:.1f}"
+        )
+        self.get_logger().info(
+            f"Track prediction/reid: moving_speed_threshold={self.track_moving_speed_threshold_mps:.2f}m/s, "
+            f"reid_distance={self.track_reid_max_distance_m:.2f}m, "
+            f"reid_size_delta={self.track_reid_max_size_ratio_delta:.2f}, "
+            f"reid_yaw_diff_deg={self.track_reid_max_yaw_diff_deg:.1f}"
         )
         self.get_logger().info(
             f"Marker yaw: mode={self.marker_yaw_mode}, "
@@ -1215,6 +1394,9 @@ class YoloObbBevDetectorNode(Node):
         self.get_logger().info(
             f"Stable track output: enabled={self.publish_stable_tracks}, "
             f"topic={self.stable_track_topic}, include_lost={self.stable_track_include_lost}"
+        )
+        self.get_logger().info(
+            f"BEV image output: enabled={self.publish_bev_image}, topic={self.bev_image_topic}"
         )
         self.get_logger().info(f"Marker topic: {self.marker_topic}")
         self.get_logger().info(f"Centroid topic: {self.centroid_topic}")
@@ -1277,6 +1459,14 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("track_position_alpha", 0.25)
         self.declare_parameter("track_yaw_alpha", 0.20)
         self.declare_parameter("track_confidence_alpha", 0.35)
+        self.declare_parameter("track_moving_match_distance_m", 0.90)
+        self.declare_parameter("track_lost_match_distance_m", 1.30)
+        self.declare_parameter("track_moving_yaw_gate_deg", 75.0)
+        self.declare_parameter("track_lost_yaw_gate_deg", 100.0)
+        self.declare_parameter("track_reid_max_distance_m", 1.50)
+        self.declare_parameter("track_reid_max_size_ratio_delta", 0.35)
+        self.declare_parameter("track_reid_max_yaw_diff_deg", 100.0)
+        self.declare_parameter("track_moving_speed_threshold_mps", 0.15)
 
         self.declare_parameter("marker_topic", "/detection/rack_obb_markers")
         self.declare_parameter("centroid_topic", "/detection/rack_centroids")
@@ -1284,6 +1474,8 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("stable_track_topic", "/tracking/stable_tracks")
         self.declare_parameter("publish_stable_tracks", True)
         self.declare_parameter("stable_track_include_lost", True)
+        self.declare_parameter("bev_image_topic", "/detection/bev_image")
+        self.declare_parameter("publish_bev_image", True)
         self.declare_parameter("publish_tracking_centroids", False)
 
     def load_parameters(self) -> None:
@@ -1346,6 +1538,14 @@ class YoloObbBevDetectorNode(Node):
         self.track_position_alpha = float(self.get_parameter("track_position_alpha").value)
         self.track_yaw_alpha = float(self.get_parameter("track_yaw_alpha").value)
         self.track_confidence_alpha = float(self.get_parameter("track_confidence_alpha").value)
+        self.track_moving_match_distance_m = float(self.get_parameter("track_moving_match_distance_m").value)
+        self.track_lost_match_distance_m = float(self.get_parameter("track_lost_match_distance_m").value)
+        self.track_moving_yaw_gate_deg = float(self.get_parameter("track_moving_yaw_gate_deg").value)
+        self.track_lost_yaw_gate_deg = float(self.get_parameter("track_lost_yaw_gate_deg").value)
+        self.track_reid_max_distance_m = float(self.get_parameter("track_reid_max_distance_m").value)
+        self.track_reid_max_size_ratio_delta = float(self.get_parameter("track_reid_max_size_ratio_delta").value)
+        self.track_reid_max_yaw_diff_deg = float(self.get_parameter("track_reid_max_yaw_diff_deg").value)
+        self.track_moving_speed_threshold_mps = float(self.get_parameter("track_moving_speed_threshold_mps").value)
 
         self.marker_topic = str(self.get_parameter("marker_topic").value)
         self.centroid_topic = str(self.get_parameter("centroid_topic").value)
@@ -1353,6 +1553,8 @@ class YoloObbBevDetectorNode(Node):
         self.stable_track_topic = str(self.get_parameter("stable_track_topic").value)
         self.publish_stable_tracks = bool(self.get_parameter("publish_stable_tracks").value)
         self.stable_track_include_lost = bool(self.get_parameter("stable_track_include_lost").value)
+        self.bev_image_topic = str(self.get_parameter("bev_image_topic").value)
+        self.publish_bev_image = bool(self.get_parameter("publish_bev_image").value)
         self.publish_tracking_centroids = bool(self.get_parameter("publish_tracking_centroids").value)
 
     def initialize_model(self) -> None:
@@ -1405,7 +1607,7 @@ class YoloObbBevDetectorNode(Node):
         stats["published_detections"] = len(detections)
         stats["active_tracks"] = len(self.track_stabilizer.tracks) if self.track_enabled else 0
 
-        self.publish_detections(detections, msg.header.stamp, stats)
+        self.publish_detections(detections, msg.header.stamp, stats, bev_image)
 
         side_count = sum(1 for detection in detections if detection.class_id == 0)
         top_count = sum(1 for detection in detections if detection.class_id == 1)
@@ -1503,9 +1705,9 @@ class YoloObbBevDetectorNode(Node):
         return candidates
 
     def publish_empty(self, stamp, stats: dict) -> None:
-        self.publish_detections([], stamp, stats)
+        self.publish_detections([], stamp, stats, None)
 
-    def publish_detections(self, detections: list[RackDetection], stamp, stats: dict) -> None:
+    def publish_detections(self, detections: list[RackDetection], stamp, stats: dict, bev_image: np.ndarray | None) -> None:
         marker_array = self.marker_factory.build_marker_array(detections, stamp)
         pose_array = DetectionMessageBuilder.to_pose_array(detections, self.output_frame, stamp)
         json_message = DetectionMessageBuilder.to_json_string(detections, self.output_frame, stamp, stats)
@@ -1513,6 +1715,9 @@ class YoloObbBevDetectorNode(Node):
         self.marker_pub.publish(marker_array)
         self.centroid_pub.publish(pose_array)
         self.json_pub.publish(json_message)
+        if self.bev_image_pub is not None and bev_image is not None:
+            bev_image_message = DetectionMessageBuilder.to_bev_image_message(bev_image, self.output_frame, stamp)
+            self.bev_image_pub.publish(bev_image_message)
         if self.stable_track_pub is not None:
             stable_track_message = DetectionMessageBuilder.to_stable_tracks_json_string(
                 detections=detections,

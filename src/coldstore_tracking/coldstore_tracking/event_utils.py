@@ -33,6 +33,7 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             'class_id': int(track.class_id),
             'class_name': str(track.class_name),
             'state': str(track.state),
+            'motion_state': str(track.motion_state),
             'confidence': float(track.confidence),
             'x': float(track.centroid[0]),
             'y': float(track.centroid[1]),
@@ -48,6 +49,13 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             'hit_count': int(track.hit_count),
             'missed_updates': int(track.missed_updates),
             'source_missed_count': int(track.source_missed_count),
+            'first_seen_sec': float(track.first_seen_sec),
+            'last_seen_sec': float(track.last_seen_sec),
+            'last_confirmed_sec': float(track.last_confirmed_sec),
+            'lost_transition_count': int(track.lost_transition_count),
+            'occluded_transition_count': int(track.occluded_transition_count),
+            'reappeared_count': int(track.reappeared_count),
+            'last_motion_state_change_sec': float(track.last_motion_state_change_sec),
             'last_stamp_sec': float(track.last_stamp_sec),
         })
 

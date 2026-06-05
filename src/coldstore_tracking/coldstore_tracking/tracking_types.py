@@ -32,3 +32,13 @@ class Track:
     hit_count: int = 0
     source_missed_count: int = 0
     frame_id: str = ''
+    motion_state: str = 'newly_appeared'
+    static_streak: int = 0
+    moving_streak: int = 0
+    first_seen_sec: float = 0.0
+    last_seen_sec: float = 0.0
+    last_confirmed_sec: float = 0.0
+    lost_transition_count: int = 0
+    occluded_transition_count: int = 0
+    reappeared_count: int = 0
+    last_motion_state_change_sec: float = 0.0

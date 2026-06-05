@@ -13,17 +13,17 @@ yolo_obb_bev_detector_node:
     density_clip_count: 12
     min_points_in_roi: 1000
 
-    inference_interval_sec: 1.0
+    inference_interval_sec: 0.35
     imgsz: 1024
 
-    model_confidence_threshold: 0.03
-    confidence_threshold: 0.03
+    model_confidence_threshold: 0.25
+    confidence_threshold: 0.25
     iou_threshold: 0.50
 
     tile_size_px: 1024
     tile_overlap_ratio: 0.25
-    side_confidence_threshold: 0.20
-    top_confidence_threshold: 0.05
+    side_confidence_threshold: 0.25
+    top_confidence_threshold: 0.25
     obb_nms_iou_threshold: 0.20
 
     deduplicate_physical_racks: true
@@ -55,6 +55,14 @@ yolo_obb_bev_detector_node:
     track_position_alpha: 0.25
     track_yaw_alpha: 0.20
     track_confidence_alpha: 0.35
+    track_moving_match_distance_m: 0.90
+    track_lost_match_distance_m: 1.30
+    track_moving_yaw_gate_deg: 75.0
+    track_lost_yaw_gate_deg: 100.0
+    track_reid_max_distance_m: 1.50
+    track_reid_max_size_ratio_delta: 0.35
+    track_reid_max_yaw_diff_deg: 100.0
+    track_moving_speed_threshold_mps: 0.15
 
     marker_topic: /detection/rack_obb_markers
     centroid_topic: /detection/rack_centroids
@@ -62,6 +70,8 @@ yolo_obb_bev_detector_node:
     stable_track_topic: /tracking/stable_tracks
     publish_stable_tracks: true
     stable_track_include_lost: true
+    bev_image_topic: /detection/bev_image
+    publish_bev_image: true
 
     publish_tracking_centroids: false
 
@@ -71,3 +81,21 @@ track_manager_node:
     use_stable_tracks_input: true
     stable_track_topic: /tracking/stable_tracks
     stable_track_include_lost: true
+    newly_appeared_hold_sec: 1.5
+    motion_static_threshold_m: 0.03
+    motion_moving_threshold_m: 0.12
+    motion_required_updates: 3
+    occluded_timeout_sec: 3.0
+    disappeared_retention_sec: 4.0
+
+track_overview_gui_node:
+  ros__parameters:
+    track_state_topic: /tracking/track_states
+    map_roi_min: [-14.5, -15.0]
+    map_roi_max: [9.0, 6.0]
+    map_pixels_per_meter: 35.0
+    show_lost_tracks: true
+    refresh_rate_hz: 5.0
+    lookup_mode: track_id
+    bev_image_topic: /detection/bev_image
+    show_bev_background: true
