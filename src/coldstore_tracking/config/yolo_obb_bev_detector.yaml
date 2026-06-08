@@ -13,7 +13,7 @@ yolo_obb_bev_detector_node:
     density_clip_count: 12
     min_points_in_roi: 1000
 
-    inference_interval_sec: 0.35
+    inference_interval_sec: 0.45
     imgsz: 1024
 
     model_confidence_threshold: 0.25
@@ -100,7 +100,7 @@ track_overview_gui_node:
     map_roi_max: [9.0, 6.0]
     map_pixels_per_meter: 35.0
     show_lost_tracks: true
-    refresh_rate_hz: 5.0
+    refresh_rate_hz: 1.0
     lookup_mode: track_id
     bev_image_topic: /detection/bev_image
     show_bev_background: true
