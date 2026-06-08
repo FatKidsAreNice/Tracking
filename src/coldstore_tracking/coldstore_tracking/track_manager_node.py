@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from builtin_interfaces.msg import Duration
 from builtin_interfaces.msg import Time
 from typing import Dict, List, Tuple
 
@@ -11,16 +12,190 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .event_utils import build_track_states_payload, make_string_message, parse_string_message
+from .event_utils import (
+    as_float,
+    as_int,
+    build_track_states_payload,
+    get_payload_dict,
+    get_payload_list,
+    make_string_message,
+    parse_string_message,
+)
 from .tracking_types import Track
 
 
-class TrackManagerNode(Node):
+class MotionStateLogic:
     MOTION_STATIC = 'static'
     MOTION_MOVING = 'moving'
     MOTION_OCCLUDED = 'occluded'
     MOTION_DISAPPEARED = 'disappeared'
     MOTION_NEWLY_APPEARED = 'newly_appeared'
+
+    def __init__(
+        self,
+        newly_appeared_hold_sec: float,
+        motion_static_threshold_m: float,
+        motion_moving_threshold_m: float,
+        motion_required_updates: int,
+        occluded_timeout_sec: float,
+    ) -> None:
+        self.newly_appeared_hold_sec = float(newly_appeared_hold_sec)
+        self.motion_static_threshold_m = float(motion_static_threshold_m)
+        self.motion_moving_threshold_m = float(motion_moving_threshold_m)
+        self.motion_required_updates = max(int(motion_required_updates), 1)
+        self.occluded_timeout_sec = float(occluded_timeout_sec)
+
+    def update_confirmed_motion_state(
+        self,
+        track: Track,
+        previous_motion_state: str,
+        displacement_m: float,
+        stamp_sec: float,
+    ) -> None:
+        if displacement_m <= self.motion_static_threshold_m:
+            track.static_streak += 1
+            track.moving_streak = 0
+        elif displacement_m >= self.motion_moving_threshold_m:
+            track.moving_streak += 1
+            track.static_streak = 0
+        else:
+            track.static_streak = 0
+            track.moving_streak = 0
+
+        is_new_track = track.first_seen_sec <= 0.0 or (track.last_stamp_sec - track.first_seen_sec) <= self.newly_appeared_hold_sec
+        if is_new_track and previous_motion_state == self.MOTION_NEWLY_APPEARED:
+            track.motion_state = self.MOTION_NEWLY_APPEARED
+        elif is_new_track and track.hit_count <= self.motion_required_updates:
+            track.motion_state = self.MOTION_NEWLY_APPEARED
+        elif track.moving_streak >= self.motion_required_updates:
+            track.motion_state = self.MOTION_MOVING
+        elif track.static_streak >= self.motion_required_updates:
+            track.motion_state = self.MOTION_STATIC
+        elif previous_motion_state in (self.MOTION_STATIC, self.MOTION_MOVING):
+            track.motion_state = previous_motion_state
+        else:
+            track.motion_state = self.MOTION_STATIC
+
+        self.apply_motion_state_change(track, previous_motion_state, stamp_sec)
+
+    def update_lost_motion_state(self, track: Track, stamp_sec: float) -> None:
+        previous_motion_state = track.motion_state
+        time_since_confirmed = max(track.last_stamp_sec - track.last_confirmed_sec, 0.0)
+        if time_since_confirmed <= self.occluded_timeout_sec:
+            track.motion_state = self.MOTION_OCCLUDED
+        else:
+            track.motion_state = self.MOTION_DISAPPEARED
+        self.apply_motion_state_change(track, previous_motion_state, stamp_sec)
+
+    def apply_motion_state_change(self, track: Track, previous_motion_state: str, stamp_sec: float) -> None:
+        if track.motion_state == previous_motion_state:
+            return
+        if track.motion_state == self.MOTION_OCCLUDED:
+            track.occluded_transition_count += 1
+        track.last_motion_state_change_sec = stamp_sec
+
+
+class TrackMarkerFactory:
+    def __init__(self, marker_lifetime_sec: float) -> None:
+        self.marker_lifetime_sec = max(float(marker_lifetime_sec), 0.0)
+
+    def build_marker_array(self, tracks: Dict[int, Track], stamp, marker_frame: str) -> MarkerArray:
+        marker_array = MarkerArray()
+        marker_array.markers.extend(self.build_delete_all_markers(stamp, marker_frame))
+
+        for track in sorted(tracks.values(), key=lambda item: item.track_id):
+            marker_array.markers.append(self.build_sphere_marker(track, stamp, marker_frame))
+            marker_array.markers.append(self.build_text_marker(track, stamp, marker_frame))
+
+        return marker_array
+
+    def build_delete_all_markers(self, stamp, marker_frame: str) -> list[Marker]:
+        return [self.build_delete_all_marker(stamp, marker_frame)]
+
+    def build_delete_all_marker(self, stamp, marker_frame: str) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = marker_frame
+        marker.header.stamp = stamp
+        marker.ns = 'track_marker_cleanup'
+        marker.id = 0
+        marker.action = Marker.DELETEALL
+        return marker
+
+    def build_sphere_marker(self, track: Track, stamp, marker_frame: str) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = marker_frame
+        marker.header.stamp = stamp
+        marker.ns = 'tracks'
+        marker.id = int(track.track_id)
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(track.centroid[0])
+        marker.pose.position.y = float(track.centroid[1])
+        marker.pose.position.z = float(track.centroid[2])
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.25
+        marker.scale.y = 0.25
+        marker.scale.z = 0.25
+        marker.color.r, marker.color.g, marker.color.b = self.track_color(track)
+        marker.color.a = 0.45 if track.motion_state == MotionStateLogic.MOTION_DISAPPEARED else 1.0
+        return self.apply_lifetime(marker)
+
+    def build_text_marker(self, track: Track, stamp, marker_frame: str) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = marker_frame
+        marker.header.stamp = stamp
+        marker.ns = 'track_labels'
+        marker.id = int(track.track_id)
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(track.centroid[0])
+        marker.pose.position.y = float(track.centroid[1])
+        marker.pose.position.z = float(track.centroid[2] + 0.35)
+        marker.pose.orientation.w = 1.0
+        marker.scale.z = 0.28
+        marker.color.r = 1.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+
+        speed = float(np.linalg.norm(track.velocity))
+        barcode = track.barcode_id if track.barcode_id else '-'
+        class_label = track.class_name if track.class_name else '-'
+        marker.text = (
+            f'T{track.track_id} {track.state}/{track.motion_state} {class_label} id:{barcode} '
+            f'hit:{track.hit_count} miss:{track.source_missed_count} v:{speed:.2f}m/s'
+        )
+        return self.apply_lifetime(marker)
+
+    def track_color(self, track: Track) -> tuple[float, float, float]:
+        if track.state == 'lost':
+            return 1.0, 0.8, 0.0
+        if track.motion_state == MotionStateLogic.MOTION_MOVING:
+            return 0.0, 0.85, 0.2
+        if track.motion_state == MotionStateLogic.MOTION_NEWLY_APPEARED:
+            return 0.2, 0.6, 1.0
+        if track.motion_state == MotionStateLogic.MOTION_DISAPPEARED:
+            return 0.6, 0.6, 0.6
+        if track.missed_updates == 0:
+            return 1.0, 0.0, 0.0
+        return 1.0, 0.8, 0.0
+
+    def apply_lifetime(self, marker: Marker) -> Marker:
+        lifetime_sec = int(self.marker_lifetime_sec)
+        lifetime_nanosec = int(round((self.marker_lifetime_sec - lifetime_sec) * 1e9))
+        if lifetime_nanosec >= 1_000_000_000:
+            lifetime_sec += 1
+            lifetime_nanosec -= 1_000_000_000
+        marker.lifetime = Duration(sec=lifetime_sec, nanosec=lifetime_nanosec)
+        return marker
+
+
+class TrackManagerNode(Node):
+    MOTION_STATIC = MotionStateLogic.MOTION_STATIC
+    MOTION_MOVING = MotionStateLogic.MOTION_MOVING
+    MOTION_OCCLUDED = MotionStateLogic.MOTION_OCCLUDED
+    MOTION_DISAPPEARED = MotionStateLogic.MOTION_DISAPPEARED
+    MOTION_NEWLY_APPEARED = MotionStateLogic.MOTION_NEWLY_APPEARED
     ACTIVE_MOTION_STATES = {MOTION_STATIC, MOTION_MOVING, MOTION_NEWLY_APPEARED}
 
     def __init__(self) -> None:
@@ -35,12 +210,16 @@ class TrackManagerNode(Node):
         self.declare_parameter('use_stable_tracks_input', False)
         self.declare_parameter('stable_track_topic', '/tracking/stable_tracks')
         self.declare_parameter('stable_track_include_lost', True)
+        self.declare_parameter('stable_track_preserve_missing_tracks', False)
+        self.declare_parameter('stable_track_publish_disappeared_markers', False)
+        self.declare_parameter('stable_track_discontinuity_distance_m', 1.50)
         self.declare_parameter('newly_appeared_hold_sec', 1.5)
         self.declare_parameter('motion_static_threshold_m', 0.03)
         self.declare_parameter('motion_moving_threshold_m', 0.12)
         self.declare_parameter('motion_required_updates', 3)
         self.declare_parameter('occluded_timeout_sec', 3.0)
         self.declare_parameter('disappeared_retention_sec', 4.0)
+        self.declare_parameter('track_marker_lifetime_sec', 2.5)
 
         self.target_frame = str(self.get_parameter('target_frame').value)
         self.max_match_distance = float(self.get_parameter('max_match_distance').value)
@@ -51,12 +230,27 @@ class TrackManagerNode(Node):
         self.use_stable_tracks_input = bool(self.get_parameter('use_stable_tracks_input').value)
         self.stable_track_topic = str(self.get_parameter('stable_track_topic').value)
         self.stable_track_include_lost = bool(self.get_parameter('stable_track_include_lost').value)
+        self.stable_track_preserve_missing_tracks = bool(self.get_parameter('stable_track_preserve_missing_tracks').value)
+        self.stable_track_publish_disappeared_markers = bool(self.get_parameter('stable_track_publish_disappeared_markers').value)
+        self.stable_track_discontinuity_distance_m = float(self.get_parameter('stable_track_discontinuity_distance_m').value)
         self.newly_appeared_hold_sec = float(self.get_parameter('newly_appeared_hold_sec').value)
         self.motion_static_threshold_m = float(self.get_parameter('motion_static_threshold_m').value)
         self.motion_moving_threshold_m = float(self.get_parameter('motion_moving_threshold_m').value)
         self.motion_required_updates = max(int(self.get_parameter('motion_required_updates').value), 1)
         self.occluded_timeout_sec = float(self.get_parameter('occluded_timeout_sec').value)
         self.disappeared_retention_sec = float(self.get_parameter('disappeared_retention_sec').value)
+        self.track_marker_lifetime_sec = float(self.get_parameter('track_marker_lifetime_sec').value)
+
+        self.motion_logic = MotionStateLogic(
+            newly_appeared_hold_sec=self.newly_appeared_hold_sec,
+            motion_static_threshold_m=self.motion_static_threshold_m,
+            motion_moving_threshold_m=self.motion_moving_threshold_m,
+            motion_required_updates=self.motion_required_updates,
+            occluded_timeout_sec=self.occluded_timeout_sec,
+        )
+        self.track_marker_factory = TrackMarkerFactory(
+            marker_lifetime_sec=self.track_marker_lifetime_sec,
+        )
 
         self.tracks: Dict[int, Track] = {}
         self.next_track_id = 1
@@ -113,7 +307,10 @@ class TrackManagerNode(Node):
         self.get_logger().info(
             f'Input mode: stable_tracks={self.use_stable_tracks_input}, '
             f'stable_track_topic={self.stable_track_topic}, '
-            f'include_lost={self.stable_track_include_lost}'
+            f'include_lost={self.stable_track_include_lost}, '
+            f'preserve_missing_tracks={self.stable_track_preserve_missing_tracks}, '
+            f'publish_disappeared_markers={self.stable_track_publish_disappeared_markers}, '
+            f'discontinuity_distance_m={self.stable_track_discontinuity_distance_m:.2f}'
         )
         self.get_logger().info(
             f'Motion logic: hold_sec={self.newly_appeared_hold_sec:.2f}, '
@@ -121,7 +318,8 @@ class TrackManagerNode(Node):
             f'moving_threshold_m={self.motion_moving_threshold_m:.3f}, '
             f'required_updates={self.motion_required_updates}, '
             f'occluded_timeout_sec={self.occluded_timeout_sec:.2f}, '
-            f'disappeared_retention_sec={self.disappeared_retention_sec:.2f}'
+            f'disappeared_retention_sec={self.disappeared_retention_sec:.2f}, '
+            f'marker_lifetime_sec={self.track_marker_lifetime_sec:.2f}'
         )
 
     def centroid_callback(self, pose_array: PoseArray) -> None:
@@ -149,15 +347,15 @@ class TrackManagerNode(Node):
 
     def stable_track_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
-        tracks = payload.get('tracks', [])
-        stamp_data = payload.get('stamp', {})
+        tracks = [item for item in get_payload_list(payload, 'tracks') if isinstance(item, dict)]
+        stamp_data = get_payload_dict(payload, 'stamp')
         stamp_sec = self.stable_stamp_to_sec(stamp_data)
         frame_id = str(payload.get('frame_id', '')).strip()
 
         self.last_stamp_sec = stamp_sec
         self.last_stamp_msg = Time(
-            sec=int(stamp_data.get('sec', 0)),
-            nanosec=int(stamp_data.get('nanosec', 0)),
+            sec=as_int(stamp_data.get('sec', 0)),
+            nanosec=as_int(stamp_data.get('nanosec', 0)),
         )
         self.last_source_frame_id = frame_id
 
@@ -280,7 +478,7 @@ class TrackManagerNode(Node):
         track.last_confirmed_sec = stamp_sec
         track.frame_id = self.last_source_frame_id or self.target_frame
         track.state = 'confirmed'
-        self.update_confirmed_motion_state(
+        self.motion_logic.update_confirmed_motion_state(
             track,
             previous_motion_state=previous_motion_state,
             displacement_m=float(np.linalg.norm(track.centroid - previous_centroid)),
@@ -293,7 +491,7 @@ class TrackManagerNode(Node):
         accepted_track_ids = set()
 
         for item in items:
-            track_id = int(item.get('track_id', 0))
+            track_id = as_int(item.get('track_id', 0))
             if track_id <= 0:
                 continue
 
@@ -314,13 +512,14 @@ class TrackManagerNode(Node):
             )
             accepted_track_ids.add(track_id)
 
-        for track_id, previous_track in previous_tracks.items():
-            if track_id in accepted_track_ids:
-                continue
+        if self.stable_track_preserve_missing_tracks:
+            for track_id, previous_track in previous_tracks.items():
+                if track_id in accepted_track_ids:
+                    continue
 
-            disappeared_track = self.build_disappeared_track(previous_track, stamp_sec, frame_id)
-            if disappeared_track is not None:
-                accepted_tracks[track_id] = disappeared_track
+                disappeared_track = self.build_disappeared_track(previous_track, stamp_sec, frame_id)
+                if disappeared_track is not None:
+                    accepted_tracks[track_id] = disappeared_track
 
         self.tracks = accepted_tracks
         if self.tracks:
@@ -335,9 +534,9 @@ class TrackManagerNode(Node):
     ) -> Track:
         position = np.array(
             [
-                float(item.get('center_x', 0.0)),
-                float(item.get('center_y', 0.0)),
-                float(item.get('center_z', 0.0)),
+                as_float(item.get('center_x', 0.0)),
+                as_float(item.get('center_y', 0.0)),
+                as_float(item.get('center_z', 0.0)),
             ],
             dtype=np.float32,
         )
@@ -353,39 +552,54 @@ class TrackManagerNode(Node):
         occluded_transition_count = 0
         reappeared_count = 0
         last_motion_state_change_sec = stamp_sec
+        continuity_broken = False
 
         if previous_track is not None:
-            dt = max(stamp_sec - previous_track.last_stamp_sec, 1e-3)
-            velocity = ((position - previous_track.centroid) / dt).astype(np.float32)
-            barcode_id = previous_track.barcode_id
-            previous_motion_state = previous_track.motion_state
-            first_seen_sec = previous_track.first_seen_sec or stamp_sec
-            last_confirmed_sec = previous_track.last_confirmed_sec
-            static_streak = previous_track.static_streak
-            moving_streak = previous_track.moving_streak
-            lost_transition_count = previous_track.lost_transition_count
-            occluded_transition_count = previous_track.occluded_transition_count
-            reappeared_count = previous_track.reappeared_count
-            last_motion_state_change_sec = previous_track.last_motion_state_change_sec
+            displacement_m = float(np.linalg.norm(position - previous_track.centroid))
+            continuity_broken = self.stable_track_identity_continuity_broken(
+                previous_track=previous_track,
+                new_position=position,
+                state=state,
+                displacement_m=displacement_m,
+            )
+
+            if not continuity_broken:
+                dt = max(stamp_sec - previous_track.last_stamp_sec, 1e-3)
+                velocity = ((position - previous_track.centroid) / dt).astype(np.float32)
+                barcode_id = previous_track.barcode_id
+                previous_motion_state = previous_track.motion_state
+                first_seen_sec = previous_track.first_seen_sec or stamp_sec
+                last_confirmed_sec = previous_track.last_confirmed_sec
+                static_streak = previous_track.static_streak
+                moving_streak = previous_track.moving_streak
+                lost_transition_count = previous_track.lost_transition_count
+                occluded_transition_count = previous_track.occluded_transition_count
+                reappeared_count = previous_track.reappeared_count
+                last_motion_state_change_sec = previous_track.last_motion_state_change_sec
+            else:
+                previous_motion_state = self.MOTION_NEWLY_APPEARED
+                first_seen_sec = stamp_sec
+                last_confirmed_sec = stamp_sec if state == 'confirmed' else 0.0
+                last_motion_state_change_sec = stamp_sec
 
         track = Track(
-            track_id=int(item.get('track_id', 0)),
+            track_id=as_int(item.get('track_id', 0)),
             centroid=position,
             velocity=velocity,
-            age=max(int(item.get('hit_count', 1)), 1),
-            missed_updates=int(item.get('missed_count', 0)),
+            age=max(as_int(item.get('hit_count', 1), default=1), 1),
+            missed_updates=as_int(item.get('missed_count', 0)),
             last_stamp_sec=stamp_sec,
             barcode_id=barcode_id,
-            class_id=int(item.get('class_id', -1)),
+            class_id=as_int(item.get('class_id', -1), default=-1),
             class_name=str(item.get('class_name', '')),
             state=state,
-            confidence=float(item.get('confidence', 0.0)),
-            yaw=float(item.get('yaw', 0.0)),
-            length=float(item.get('length', 0.0)),
-            width=float(item.get('width', 0.0)),
-            height=float(item.get('height', 0.0)),
-            hit_count=int(item.get('hit_count', 0)),
-            source_missed_count=int(item.get('missed_count', 0)),
+            confidence=as_float(item.get('confidence', 0.0)),
+            yaw=as_float(item.get('yaw', 0.0)),
+            length=as_float(item.get('length', 0.0)),
+            width=as_float(item.get('width', 0.0)),
+            height=as_float(item.get('height', 0.0)),
+            hit_count=as_int(item.get('hit_count', 0)),
+            source_missed_count=as_int(item.get('missed_count', 0)),
             frame_id=frame_id,
             motion_state=previous_motion_state,
             static_streak=static_streak,
@@ -402,11 +616,11 @@ class TrackManagerNode(Node):
         if state == 'confirmed':
             track.last_confirmed_sec = stamp_sec
             displacement_m = 0.0
-            if previous_track is not None:
+            if previous_track is not None and not continuity_broken:
                 displacement_m = float(np.linalg.norm(position - previous_track.centroid))
-            if previous_track is not None and previous_track.state == 'lost':
+            if previous_track is not None and not continuity_broken and previous_track.state == 'lost':
                 track.reappeared_count += 1
-            self.update_confirmed_motion_state(
+            self.motion_logic.update_confirmed_motion_state(
                 track,
                 previous_motion_state=previous_motion_state,
                 displacement_m=displacement_m,
@@ -415,9 +629,26 @@ class TrackManagerNode(Node):
         else:
             if previous_track is None or previous_track.state != 'lost':
                 track.lost_transition_count += 1
-            self.update_lost_motion_state(track, stamp_sec=stamp_sec)
+            self.motion_logic.update_lost_motion_state(track, stamp_sec=stamp_sec)
 
         return track
+
+    def stable_track_identity_continuity_broken(
+        self,
+        previous_track: Track,
+        new_position: np.ndarray,
+        state: str,
+        displacement_m: float,
+    ) -> bool:
+        if not self.use_stable_tracks_input:
+            return False
+        if self.stable_track_discontinuity_distance_m <= 0.0:
+            return False
+        if state != 'confirmed':
+            return False
+        if previous_track.state == 'lost':
+            return False
+        return displacement_m > self.stable_track_discontinuity_distance_m
 
     def build_disappeared_track(self, previous_track: Track, stamp_sec: float, frame_id: str) -> Track | None:
         if self.disappeared_retention_sec >= 0.0:
@@ -456,58 +687,9 @@ class TrackManagerNode(Node):
             last_motion_state_change_sec=previous_track.last_motion_state_change_sec,
         )
 
-    def update_confirmed_motion_state(
-        self,
-        track: Track,
-        previous_motion_state: str,
-        displacement_m: float,
-        stamp_sec: float,
-    ) -> None:
-        if displacement_m <= self.motion_static_threshold_m:
-            track.static_streak += 1
-            track.moving_streak = 0
-        elif displacement_m >= self.motion_moving_threshold_m:
-            track.moving_streak += 1
-            track.static_streak = 0
-        else:
-            track.static_streak = 0
-            track.moving_streak = 0
-
-        is_new_track = track.first_seen_sec <= 0.0 or (track.last_stamp_sec - track.first_seen_sec) <= self.newly_appeared_hold_sec
-        if is_new_track and previous_motion_state == self.MOTION_NEWLY_APPEARED:
-            track.motion_state = self.MOTION_NEWLY_APPEARED
-        elif is_new_track and track.hit_count <= self.motion_required_updates:
-            track.motion_state = self.MOTION_NEWLY_APPEARED
-        elif track.moving_streak >= self.motion_required_updates:
-            track.motion_state = self.MOTION_MOVING
-        elif track.static_streak >= self.motion_required_updates:
-            track.motion_state = self.MOTION_STATIC
-        elif previous_motion_state in (self.MOTION_STATIC, self.MOTION_MOVING):
-            track.motion_state = previous_motion_state
-        else:
-            track.motion_state = self.MOTION_STATIC
-
-        self.apply_motion_state_change(track, previous_motion_state, stamp_sec)
-
-    def update_lost_motion_state(self, track: Track, stamp_sec: float) -> None:
-        previous_motion_state = track.motion_state
-        time_since_confirmed = max(track.last_stamp_sec - track.last_confirmed_sec, 0.0)
-        if time_since_confirmed <= self.occluded_timeout_sec:
-            track.motion_state = self.MOTION_OCCLUDED
-        else:
-            track.motion_state = self.MOTION_DISAPPEARED
-        self.apply_motion_state_change(track, previous_motion_state, stamp_sec)
-
-    def apply_motion_state_change(self, track: Track, previous_motion_state: str, stamp_sec: float) -> None:
-        if track.motion_state == previous_motion_state:
-            return
-        if track.motion_state == self.MOTION_OCCLUDED:
-            track.occluded_transition_count += 1
-        track.last_motion_state_change_sec = stamp_sec
-
     def assignment_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
-        track_id = int(payload.get('track_id', 0))
+        track_id = as_int(payload.get('track_id', 0))
         barcode_id = str(payload.get('barcode_id', ''))
 
         if track_id <= 0 or not barcode_id:
@@ -531,7 +713,7 @@ class TrackManagerNode(Node):
 
     def remove_track_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
-        track_id = int(payload.get('track_id', 0))
+        track_id = as_int(payload.get('track_id', 0))
         barcode_id = str(payload.get('barcode_id', ''))
 
         if track_id <= 0:
@@ -574,85 +756,15 @@ class TrackManagerNode(Node):
         self.track_state_pub.publish(make_string_message(payload))
 
     def publish_track_markers(self, stamp) -> None:
-        marker_array = MarkerArray()
-
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-
         marker_frame = self.last_source_frame_id or self.target_frame
-        marker_id = 0
-        for track in sorted(self.tracks.values(), key=lambda item: item.track_id):
-            sphere = Marker()
-            sphere.header.frame_id = marker_frame
-            sphere.header.stamp = stamp
-            sphere.ns = 'tracks'
-            sphere.id = marker_id
-            sphere.type = Marker.SPHERE
-            sphere.action = Marker.ADD
-            sphere.pose.position.x = float(track.centroid[0])
-            sphere.pose.position.y = float(track.centroid[1])
-            sphere.pose.position.z = float(track.centroid[2])
-            sphere.pose.orientation.w = 1.0
-            sphere.scale.x = 0.25
-            sphere.scale.y = 0.25
-            sphere.scale.z = 0.25
-
-            if track.state == 'lost':
-                sphere.color.r = 1.0
-                sphere.color.g = 0.8
-                sphere.color.b = 0.0
-            elif track.motion_state == self.MOTION_MOVING:
-                sphere.color.r = 0.0
-                sphere.color.g = 0.85
-                sphere.color.b = 0.2
-            elif track.motion_state == self.MOTION_NEWLY_APPEARED:
-                sphere.color.r = 0.2
-                sphere.color.g = 0.6
-                sphere.color.b = 1.0
-            elif track.motion_state == self.MOTION_DISAPPEARED:
-                sphere.color.r = 0.6
-                sphere.color.g = 0.6
-                sphere.color.b = 0.6
-            elif track.missed_updates == 0:
-                sphere.color.r = 1.0
-                sphere.color.g = 0.0
-                sphere.color.b = 0.0
-            else:
-                sphere.color.r = 1.0
-                sphere.color.g = 0.8
-                sphere.color.b = 0.0
-            sphere.color.a = 0.45 if track.motion_state == self.MOTION_DISAPPEARED else 1.0
-            marker_array.markers.append(sphere)
-            marker_id += 1
-
-            text = Marker()
-            text.header.frame_id = marker_frame
-            text.header.stamp = stamp
-            text.ns = 'track_labels'
-            text.id = marker_id
-            text.type = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.pose.position.x = float(track.centroid[0])
-            text.pose.position.y = float(track.centroid[1])
-            text.pose.position.z = float(track.centroid[2] + 0.35)
-            text.pose.orientation.w = 1.0
-            text.scale.z = 0.28
-            text.color.r = 1.0
-            text.color.g = 1.0
-            text.color.b = 0.0
-            text.color.a = 1.0
-
-            speed = float(np.linalg.norm(track.velocity))
-            barcode = track.barcode_id if track.barcode_id else '-'
-            class_label = track.class_name if track.class_name else '-'
-            text.text = (
-                f'T{track.track_id} {track.state}/{track.motion_state} {class_label} id:{barcode} '
-                f'hit:{track.hit_count} miss:{track.source_missed_count} v:{speed:.2f}m/s'
-            )
-            marker_array.markers.append(text)
-            marker_id += 1
-
+        marker_tracks = self.tracks
+        if self.use_stable_tracks_input and not self.stable_track_publish_disappeared_markers:
+            marker_tracks = {
+                track_id: track
+                for track_id, track in self.tracks.items()
+                if track.state in ('confirmed', 'lost')
+            }
+        marker_array = self.track_marker_factory.build_marker_array(marker_tracks, stamp, marker_frame)
         self.track_marker_pub.publish(marker_array)
 
     def pose_array_to_detections(self, pose_array: PoseArray) -> List[np.ndarray]:
@@ -679,7 +791,7 @@ class TrackManagerNode(Node):
 
     @staticmethod
     def stable_stamp_to_sec(stamp_data: dict) -> float:
-        return float(stamp_data.get('sec', 0)) + float(stamp_data.get('nanosec', 0)) * 1e-9
+        return as_float(stamp_data.get('sec', 0)) + as_float(stamp_data.get('nanosec', 0)) * 1e-9
 
 
 def main(args=None) -> None:

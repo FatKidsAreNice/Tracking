@@ -11,9 +11,28 @@
 - `src/coldstore_tracking/config/`
   - ROS 2 parameter YAML files.
 - `src/coldstore_tracking/launch/`
-  - Launch files for the legacy cluster pipeline.
+  - Launch files for the legacy cluster pipeline and the YOLO OBB live pipeline.
 - Workspace root scripts
   - Dataset prep, pseudo-label generation, BEV export, and debugging utilities.
+
+## Workspace Root Scripts
+- Runtime/manual launch helper
+  - `lidar_setup.launch.py`
+- Offline inference and pseudo-label generation
+  - `offline_full_bev_sliding_window_predict.py`
+  - `generate_pseudo_labels_from_full_bev.py`
+  - `create_clean_pseudo_label_import.py`
+- Dataset preparation/export utilities
+  - `prepare_yolo_obb_v2_tiled_dataset.py`
+  - `prepare_yolo_obb_v3_tiled_dataset.py`
+  - `prepare_yolo_obb_v3b_tiled_dataset.py`
+  - `prepare_yolo_obb_v4m_racksv2_tiled_dataset.py`
+  - `normalize_racks_v2_export.py`
+- Debug/inspection utilities
+  - `check_cloud_bounds.py`
+  - `debug_cluster_markers.py`
+  - `view_background_npz.py`
+- Root scripts are not package entry points unless `setup.py` explicitly registers them.
 
 ## Key Runtime Nodes
 - `yolo_obb_bev_detector_node.py`
@@ -83,6 +102,14 @@
   - Main config for the YOLO + MOT-Light path.
 - `src/coldstore_tracking/config/real_single_lidar_tracking.yaml`
   - Main config for the older cluster-based pipeline.
+
+## Launch Files
+- `src/coldstore_tracking/launch/yolo_obb_tracking_pipeline.launch.py`
+  - Current YOLO OBB live pipeline: YOLO detector, TrackManager, optional Track Overview GUI.
+- `src/coldstore_tracking/launch/real_single_lidar_tracking.launch.py`
+  - Legacy single-LiDAR cluster pipeline.
+- `src/coldstore_tracking/launch/tracking_pipeline.launch.py`
+  - Older simulation/cluster pipeline.
 
 ## How To Work Safely
 - Preserve existing topics unless there is a clear reason to add a new one.

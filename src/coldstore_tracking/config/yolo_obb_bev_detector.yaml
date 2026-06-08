@@ -41,6 +41,7 @@ yolo_obb_bev_detector_node:
     rack_floor_z: -0.95
     marker_alpha: 0.35
     text_marker_enabled: true
+    text_marker_include_id: false
     marker_lifetime_sec: 2.5
 
     track_enabled: true
@@ -81,12 +82,16 @@ track_manager_node:
     use_stable_tracks_input: true
     stable_track_topic: /tracking/stable_tracks
     stable_track_include_lost: true
+    stable_track_preserve_missing_tracks: false
+    stable_track_publish_disappeared_markers: false
+    stable_track_discontinuity_distance_m: 1.50
     newly_appeared_hold_sec: 1.5
     motion_static_threshold_m: 0.03
     motion_moving_threshold_m: 0.12
     motion_required_updates: 3
     occluded_timeout_sec: 3.0
     disappeared_retention_sec: 4.0
+    track_marker_lifetime_sec: 2.5
 
 track_overview_gui_node:
   ros__parameters:
@@ -99,3 +104,4 @@ track_overview_gui_node:
     lookup_mode: track_id
     bev_image_topic: /detection/bev_image
     show_bev_background: true
+    bev_overlay_max_time_delta_sec: 0.75

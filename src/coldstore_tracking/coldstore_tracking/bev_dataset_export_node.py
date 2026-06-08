@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -12,168 +10,16 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
-from sensor_msgs_py import point_cloud2
+
+try:
+    from .bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
+except ImportError:
+    from bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
 
 try:
     import cv2
 except ImportError:
     cv2 = None
-
-
-@dataclass(frozen=True)
-class BevGeometry:
-    roi_min: np.ndarray
-    roi_max: np.ndarray
-    resolution_m_per_px: float
-    width_px: int
-    height_px: int
-
-    @staticmethod
-    def from_roi(roi_min: list[float], roi_max: list[float], resolution_m_per_px: float) -> "BevGeometry":
-        min_values = np.asarray(roi_min, dtype=np.float32)
-        max_values = np.asarray(roi_max, dtype=np.float32)
-
-        width_px = int(math.ceil((float(max_values[0]) - float(min_values[0])) / resolution_m_per_px))
-        height_px = int(math.ceil((float(max_values[1]) - float(min_values[1])) / resolution_m_per_px))
-
-        return BevGeometry(
-            roi_min=min_values,
-            roi_max=max_values,
-            resolution_m_per_px=float(resolution_m_per_px),
-            width_px=width_px,
-            height_px=height_px,
-        )
-
-    def world_to_pixel(self, points_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        x_values = points_xyz[:, 0]
-        y_values = points_xyz[:, 1]
-        z_values = points_xyz[:, 2]
-
-        roi_mask = (
-            (x_values >= self.roi_min[0])
-            & (x_values <= self.roi_max[0])
-            & (y_values >= self.roi_min[1])
-            & (y_values <= self.roi_max[1])
-            & (z_values >= self.roi_min[2])
-            & (z_values <= self.roi_max[2])
-        )
-
-        filtered_points = points_xyz[roi_mask]
-
-        if filtered_points.size == 0:
-            return (
-                np.empty(0, dtype=np.int32),
-                np.empty(0, dtype=np.int32),
-                filtered_points,
-            )
-
-        u_values = np.floor((filtered_points[:, 0] - self.roi_min[0]) / self.resolution_m_per_px).astype(np.int32)
-        v_values = np.floor((self.roi_max[1] - filtered_points[:, 1]) / self.resolution_m_per_px).astype(np.int32)
-
-        image_mask = (
-            (u_values >= 0)
-            & (u_values < self.width_px)
-            & (v_values >= 0)
-            & (v_values < self.height_px)
-        )
-
-        return u_values[image_mask], v_values[image_mask], filtered_points[image_mask]
-
-
-class PointCloudReader:
-    @staticmethod
-    def to_xyz_array(msg: PointCloud2) -> np.ndarray:
-        if hasattr(point_cloud2, "read_points_numpy"):
-            try:
-                points = point_cloud2.read_points_numpy(
-                    msg,
-                    field_names=("x", "y", "z"),
-                    skip_nans=True,
-                )
-
-                if isinstance(points, np.ndarray):
-                    if points.dtype.names:
-                        xyz = np.vstack((points["x"], points["y"], points["z"])).T
-                    else:
-                        xyz = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-
-                    return PointCloudReader._finite_xyz(xyz)
-            except Exception:
-                pass
-
-        points_iter = point_cloud2.read_points(
-            msg,
-            field_names=("x", "y", "z"),
-            skip_nans=True,
-        )
-
-        xyz = np.asarray([[point[0], point[1], point[2]] for point in points_iter], dtype=np.float32)
-        return PointCloudReader._finite_xyz(xyz)
-
-    @staticmethod
-    def _finite_xyz(points: np.ndarray) -> np.ndarray:
-        if points.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
-
-        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-        finite_mask = np.all(np.isfinite(points), axis=1)
-        return points[finite_mask]
-
-
-class BevImageBuilder:
-    def __init__(self, geometry: BevGeometry, density_clip_count: int) -> None:
-        self.geometry = geometry
-        self.density_clip_count = max(int(density_clip_count), 1)
-
-    def build(self, points_xyz: np.ndarray) -> tuple[np.ndarray, dict]:
-        u_values, v_values, filtered_points = self.geometry.world_to_pixel(points_xyz)
-
-        occupancy = np.zeros((self.geometry.height_px, self.geometry.width_px), dtype=np.uint8)
-        height_image = np.zeros_like(occupancy)
-        density_counts = np.zeros((self.geometry.height_px, self.geometry.width_px), dtype=np.uint16)
-
-        if filtered_points.size == 0:
-            image = np.dstack((occupancy, height_image, occupancy))
-            stats = self._stats(points_xyz, filtered_points, occupancy, density_counts)
-            return image, stats
-
-        occupancy[v_values, u_values] = 255
-        np.add.at(density_counts, (v_values, u_values), 1)
-
-        z_min = float(self.geometry.roi_min[2])
-        z_max = float(self.geometry.roi_max[2])
-        z_range = max(z_max - z_min, 1e-6)
-
-        z_normalized = np.clip(((filtered_points[:, 2] - z_min) / z_range) * 255.0, 0.0, 255.0).astype(np.uint8)
-        np.maximum.at(height_image, (v_values, u_values), z_normalized)
-
-        density_normalized = np.clip(
-            (np.log1p(density_counts.astype(np.float32)) / math.log1p(self.density_clip_count)) * 255.0,
-            0.0,
-            255.0,
-        ).astype(np.uint8)
-
-        image = np.dstack((occupancy, height_image, density_normalized))
-        stats = self._stats(points_xyz, filtered_points, occupancy, density_counts)
-
-        return image, stats
-
-    def _stats(
-        self,
-        raw_points: np.ndarray,
-        filtered_points: np.ndarray,
-        occupancy: np.ndarray,
-        density_counts: np.ndarray,
-    ) -> dict:
-        occupied_pixels = int(np.count_nonzero(occupancy))
-        max_density = int(density_counts.max()) if density_counts.size else 0
-
-        return {
-            "points_raw": int(raw_points.shape[0]),
-            "points_in_roi": int(filtered_points.shape[0]),
-            "occupied_pixels": occupied_pixels,
-            "max_density_per_pixel": max_density,
-        }
 
 
 class KeyframeDecision:

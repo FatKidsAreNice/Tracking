@@ -13,7 +13,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-from .event_utils import parse_string_message
+from .event_utils import as_float, as_int, get_payload_list, parse_string_message
 
 
 class TrackOverviewGuiNode(Node):
@@ -29,6 +29,7 @@ class TrackOverviewGuiNode(Node):
         self.declare_parameter('lookup_mode', 'track_id')
         self.declare_parameter('bev_image_topic', '/detection/bev_image')
         self.declare_parameter('show_bev_background', True)
+        self.declare_parameter('bev_overlay_max_time_delta_sec', 0.75)
 
         self.track_state_topic = str(self.get_parameter('track_state_topic').value)
         self.map_roi_min = [float(value) for value in self.get_parameter('map_roi_min').value]
@@ -39,6 +40,7 @@ class TrackOverviewGuiNode(Node):
         self.lookup_mode = str(self.get_parameter('lookup_mode').value).strip() or 'track_id'
         self.bev_image_topic = str(self.get_parameter('bev_image_topic').value)
         self.show_bev_background = bool(self.get_parameter('show_bev_background').value)
+        self.bev_overlay_max_time_delta_sec = float(self.get_parameter('bev_overlay_max_time_delta_sec').value)
 
         self.latest_payload: Dict[str, Any] = {}
         self.latest_tracks_by_id: Dict[int, Dict[str, Any]] = {}
@@ -46,6 +48,12 @@ class TrackOverviewGuiNode(Node):
         self.canvas_padding = 20
         self.latest_bev_image: np.ndarray | None = None
         self.bev_photo_image: tk.PhotoImage | None = None
+        self.latest_track_stamp_sec = 0.0
+        self.latest_bev_stamp_sec = 0.0
+        self.latest_bev_frame_id = ''
+        self.latest_bev_version = 0
+        self.rendered_bev_version = -1
+        self.rendered_bev_size: tuple[int, int] | None = None
 
         self.create_subscription(String, self.track_state_topic, self.track_state_callback, 10)
         self.create_subscription(Image, self.bev_image_topic, self.bev_image_callback, 10)
@@ -158,16 +166,17 @@ class TrackOverviewGuiNode(Node):
 
     def track_state_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
-        tracks = payload.get('tracks', [])
+        tracks = [track for track in get_payload_list(payload, 'tracks') if isinstance(track, dict)]
+        self.latest_track_stamp_sec = as_float(payload.get('stamp_sec', 0.0))
 
         if not self.show_lost_tracks:
             tracks = [track for track in tracks if str(track.get('state', '')) != 'lost']
 
         self.latest_payload = payload
         self.latest_tracks_by_id = {
-            int(track.get('track_id', 0)): track
+            as_int(track.get('track_id', 0)): track
             for track in tracks
-            if int(track.get('track_id', 0)) > 0
+            if as_int(track.get('track_id', 0)) > 0
         }
 
         if self.selected_track_id is not None and self.selected_track_id not in self.latest_tracks_by_id:
@@ -202,6 +211,9 @@ class TrackOverviewGuiNode(Node):
 
         bev_image = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
         self.latest_bev_image = bev_image.copy()
+        self.latest_bev_stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        self.latest_bev_frame_id = str(msg.header.frame_id)
+        self.latest_bev_version += 1
 
     def clear_selection(self) -> None:
         self.selected_track_id = None
@@ -244,11 +256,11 @@ class TrackOverviewGuiNode(Node):
 
     def populate_tree(self) -> None:
         existing_ids = set(self.tree.get_children())
-        sorted_tracks = sorted(self.latest_tracks_by_id.values(), key=lambda track: int(track.get('track_id', 0)))
+        sorted_tracks = sorted(self.latest_tracks_by_id.values(), key=lambda track: as_int(track.get('track_id', 0)))
         active_ids = set()
 
         for track in sorted_tracks:
-            track_id = int(track.get('track_id', 0))
+            track_id = as_int(track.get('track_id', 0))
             item_id = str(track_id)
             active_ids.add(item_id)
             values = (
@@ -256,11 +268,11 @@ class TrackOverviewGuiNode(Node):
                 str(track.get('class_name', '-')),
                 str(track.get('state', '-')),
                 str(track.get('motion_state', '-')),
-                f"{float(track.get('confidence', 0.0)):.2f}",
-                f"{float(track.get('x', 0.0)):.2f} / {float(track.get('y', 0.0)):.2f} / {float(track.get('z', 0.0)):.2f}",
-                f"{float(track.get('yaw', 0.0)):.2f}",
-                int(track.get('hit_count', 0)),
-                int(track.get('source_missed_count', 0)),
+                f"{as_float(track.get('confidence', 0.0)):.2f}",
+                f"{as_float(track.get('x', 0.0)):.2f} / {as_float(track.get('y', 0.0)):.2f} / {as_float(track.get('z', 0.0)):.2f}",
+                f"{as_float(track.get('yaw', 0.0)):.2f}",
+                as_int(track.get('hit_count', 0)),
+                as_int(track.get('source_missed_count', 0)),
             )
             if item_id in existing_ids:
                 self.tree.item(item_id, values=values)
@@ -296,11 +308,13 @@ class TrackOverviewGuiNode(Node):
             font=('TkDefaultFont', 11, 'bold'),
         )
 
-        for track in sorted(self.latest_tracks_by_id.values(), key=lambda item: int(item.get('track_id', 0))):
-            track_id = int(track.get('track_id', 0))
+        self.draw_overlay_status(canvas_width, canvas_height)
+
+        for track in sorted(self.latest_tracks_by_id.values(), key=lambda item: as_int(item.get('track_id', 0))):
+            track_id = as_int(track.get('track_id', 0))
             x_px, y_px = self.world_to_canvas(
-                float(track.get('x', 0.0)),
-                float(track.get('y', 0.0)),
+                as_float(track.get('x', 0.0)),
+                as_float(track.get('y', 0.0)),
                 canvas_width,
                 canvas_height,
             )
@@ -310,7 +324,7 @@ class TrackOverviewGuiNode(Node):
             outline = '#111111' if is_selected else ''
             self.canvas.create_oval(x_px - radius, y_px - radius, x_px + radius, y_px + radius, fill=fill, outline=outline, width=2 if is_selected else 0)
 
-            yaw = float(track.get('yaw', 0.0))
+            yaw = as_float(track.get('yaw', 0.0))
             arrow_length = 26 if is_selected else 18
             arrow_x = x_px + math.cos(yaw) * arrow_length
             arrow_y = y_px - math.sin(yaw) * arrow_length
@@ -332,51 +346,99 @@ class TrackOverviewGuiNode(Node):
 
         target_width = max(canvas_width - 2 * self.canvas_padding, 1)
         target_height = max(canvas_height - 2 * self.canvas_padding, 1)
-        resized_image = cv2.resize(self.latest_bev_image, (target_width, target_height), interpolation=cv2.INTER_AREA)
-        success, png_buffer = cv2.imencode('.png', cv2.cvtColor(resized_image, cv2.COLOR_RGB2BGR))
-        if not success:
-            self.status_var.set('Failed to encode BEV background image.')
-            return
+        target_size = (target_width, target_height)
 
-        try:
-            self.bev_photo_image = tk.PhotoImage(data=base64.b64encode(png_buffer.tobytes()).decode('ascii'))
+        if self.rendered_bev_version != self.latest_bev_version or self.rendered_bev_size != target_size:
+            resized_image = cv2.resize(self.latest_bev_image, target_size, interpolation=cv2.INTER_AREA)
+            success, png_buffer = cv2.imencode('.png', cv2.cvtColor(resized_image, cv2.COLOR_RGB2BGR))
+            if not success:
+                self.status_var.set('Failed to encode BEV background image.')
+                return
+
+            try:
+                self.bev_photo_image = tk.PhotoImage(data=base64.b64encode(png_buffer.tobytes()).decode('ascii'))
+            except tk.TclError as exc:
+                self.status_var.set(f'Failed to render BEV background: {exc}')
+                return
+
+            self.rendered_bev_version = self.latest_bev_version
+            self.rendered_bev_size = target_size
+
+        if self.bev_photo_image is not None:
             self.canvas.create_image(
                 self.canvas_padding,
                 self.canvas_padding,
                 anchor='nw',
                 image=self.bev_photo_image,
             )
-        except tk.TclError as exc:
-            self.status_var.set(f'Failed to render BEV background: {exc}')
+
+    def draw_overlay_status(self, canvas_width: int, canvas_height: int) -> None:
+        delta = self.bev_track_time_delta()
+        if delta is None:
+            status_text = 'BEV/Track sync: waiting for both streams'
+            fill = '#6b6b6b'
+        else:
+            status_text = (
+                f'BEV/Track delta: {delta:.3f}s | '
+                f'track={self.latest_track_stamp_sec:.3f} bev={self.latest_bev_stamp_sec:.3f}'
+            )
+            fill = '#b00020' if delta > self.bev_overlay_max_time_delta_sec else '#245c2f'
+
+        self.canvas.create_text(
+            canvas_width - self.canvas_padding - 8,
+            canvas_height - self.canvas_padding + 4,
+            text=status_text,
+            anchor='ne',
+            fill=fill,
+            font=('TkDefaultFont', 9, 'bold' if fill == '#b00020' else 'normal'),
+        )
+
+    def bev_track_time_delta(self) -> float | None:
+        if self.latest_track_stamp_sec <= 0.0 or self.latest_bev_stamp_sec <= 0.0:
+            return None
+        return abs(self.latest_track_stamp_sec - self.latest_bev_stamp_sec)
 
     def update_detail_panel(self, track: Dict[str, Any] | None) -> None:
+        sync_delta = self.bev_track_time_delta()
+        sync_text = 'unknown' if sync_delta is None else f'{sync_delta:.3f}s'
+        if sync_delta is None:
+            sync_state = 'unknown'
+        else:
+            sync_state = 'stale' if sync_delta > self.bev_overlay_max_time_delta_sec else 'ok'
+
         if track is None:
             track_count = len(self.latest_tracks_by_id)
-            self.detail_var.set(f'No track selected.\nVisible tracks: {track_count}')
+            self.detail_var.set(
+                f'No track selected.\n'
+                f'Visible tracks: {track_count}\n'
+                f'BEV/Track delta: {sync_text} ({sync_state})'
+            )
             return
 
         detail_lines = [
             f"Display ID: {self.build_display_label(track)}",
-            f"Track ID: {int(track.get('track_id', 0))}",
+            f"Track ID: {as_int(track.get('track_id', 0))}",
             f"Class: {str(track.get('class_name', '-'))}",
             f"State: {str(track.get('state', '-'))}",
             f"Motion: {str(track.get('motion_state', '-'))}",
-            f"Confidence: {float(track.get('confidence', 0.0)):.3f}",
+            f"Confidence: {as_float(track.get('confidence', 0.0)):.3f}",
             f"Frame: {str(self.latest_payload.get('frame_id', '-'))}",
-            f"Position: x={float(track.get('x', 0.0)):.3f}, y={float(track.get('y', 0.0)):.3f}, z={float(track.get('z', 0.0)):.3f}",
-            f"Yaw: {float(track.get('yaw', 0.0)):.3f}",
-            f"Size: L={float(track.get('length', 0.0)):.3f}, W={float(track.get('width', 0.0)):.3f}, H={float(track.get('height', 0.0)):.3f}",
-            f"Hits: {int(track.get('hit_count', 0))} | Missed: {int(track.get('source_missed_count', 0))}",
-            f"Lost transitions: {int(track.get('lost_transition_count', 0))}",
-            f"Occluded transitions: {int(track.get('occluded_transition_count', 0))}",
-            f"Reappeared count: {int(track.get('reappeared_count', 0))}",
-            f"Motion state changed at: {float(track.get('last_motion_state_change_sec', 0.0)):.3f}",
-            f"Last update: {float(track.get('last_stamp_sec', 0.0)):.3f}",
+            f"Position: x={as_float(track.get('x', 0.0)):.3f}, y={as_float(track.get('y', 0.0)):.3f}, z={as_float(track.get('z', 0.0)):.3f}",
+            f"Yaw: {as_float(track.get('yaw', 0.0)):.3f}",
+            f"Size: L={as_float(track.get('length', 0.0)):.3f}, W={as_float(track.get('width', 0.0)):.3f}, H={as_float(track.get('height', 0.0)):.3f}",
+            f"Hits: {as_int(track.get('hit_count', 0))} | Missed: {as_int(track.get('source_missed_count', 0))}",
+            f"Lost transitions: {as_int(track.get('lost_transition_count', 0))}",
+            f"Occluded transitions: {as_int(track.get('occluded_transition_count', 0))}",
+            f"Reappeared count: {as_int(track.get('reappeared_count', 0))}",
+            f"Motion state changed at: {as_float(track.get('last_motion_state_change_sec', 0.0)):.3f}",
+            f"Last update: {as_float(track.get('last_stamp_sec', 0.0)):.3f}",
+            f"BEV frame: {self.latest_bev_frame_id or '-'}",
+            f"BEV/Track delta: {sync_text} ({sync_state})",
         ]
         self.detail_var.set('\n'.join(detail_lines))
 
     def build_display_label(self, track: Dict[str, Any]) -> str:
-        track_id = int(track.get('track_id', 0))
+        track_id = as_int(track.get('track_id', 0))
         if self.lookup_mode == 'barcode_id':
             barcode_id = str(track.get('barcode_id', '')).strip()
             if barcode_id:

@@ -15,9 +15,13 @@ from geometry_msgs.msg import Pose, PoseArray
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
+
+try:
+    from .bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
+except ImportError:
+    from bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
 
 try:
     from ultralytics import YOLO
@@ -26,88 +30,6 @@ except ImportError as exc:
     YOLO_IMPORT_ERROR = exc
 else:
     YOLO_IMPORT_ERROR = None
-
-
-@dataclass(frozen=True)
-class BevGeometry:
-    roi_min: np.ndarray
-    roi_max: np.ndarray
-    resolution_m_per_px: float
-    width_px: int
-    height_px: int
-
-    @staticmethod
-    def from_values(
-        roi_min: list[float],
-        roi_max: list[float],
-        resolution_m_per_px: float,
-    ) -> "BevGeometry":
-        min_values = np.asarray(roi_min, dtype=np.float32)
-        max_values = np.asarray(roi_max, dtype=np.float32)
-
-        width_px = int(math.ceil((float(max_values[0]) - float(min_values[0])) / resolution_m_per_px))
-        height_px = int(math.ceil((float(max_values[1]) - float(min_values[1])) / resolution_m_per_px))
-
-        return BevGeometry(
-            roi_min=min_values,
-            roi_max=max_values,
-            resolution_m_per_px=float(resolution_m_per_px),
-            width_px=width_px,
-            height_px=height_px,
-        )
-
-    def filter_points_to_roi(self, points_xyz: np.ndarray) -> np.ndarray:
-        if points_xyz.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
-
-        x_values = points_xyz[:, 0]
-        y_values = points_xyz[:, 1]
-        z_values = points_xyz[:, 2]
-
-        roi_mask = (
-            (x_values >= self.roi_min[0])
-            & (x_values <= self.roi_max[0])
-            & (y_values >= self.roi_min[1])
-            & (y_values <= self.roi_max[1])
-            & (z_values >= self.roi_min[2])
-            & (z_values <= self.roi_max[2])
-        )
-
-        return points_xyz[roi_mask].astype(np.float32)
-
-    def points_to_pixels(self, points_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        filtered_points = self.filter_points_to_roi(points_xyz)
-
-        if filtered_points.size == 0:
-            return (
-                np.empty(0, dtype=np.int32),
-                np.empty(0, dtype=np.int32),
-                filtered_points,
-            )
-
-        u_values = np.floor((filtered_points[:, 0] - self.roi_min[0]) / self.resolution_m_per_px).astype(np.int32)
-        v_values = np.floor((self.roi_max[1] - filtered_points[:, 1]) / self.resolution_m_per_px).astype(np.int32)
-
-        image_mask = (
-            (u_values >= 0)
-            & (u_values < self.width_px)
-            & (v_values >= 0)
-            & (v_values < self.height_px)
-        )
-
-        return u_values[image_mask], v_values[image_mask], filtered_points[image_mask]
-
-    def pixel_to_world_xy(self, pixel_xy: np.ndarray) -> np.ndarray:
-        pixel_xy = np.asarray(pixel_xy, dtype=np.float32)
-
-        u_values = pixel_xy[:, 0]
-        v_values = pixel_xy[:, 1]
-
-        x_values = self.roi_min[0] + (u_values + 0.5) * self.resolution_m_per_px
-        y_values = self.roi_max[1] - (v_values + 0.5) * self.resolution_m_per_px
-
-        return np.stack((x_values, y_values), axis=1).astype(np.float32)
-
 
 @dataclass(frozen=True)
 class TileWindow:
@@ -271,11 +193,14 @@ class TrackStabilizer:
 
         for detection_index, detection in enumerate(detections):
             if detection_index not in matched_detection_indices:
+                if self.try_recover_lost_track(detection, now_sec):
+                    continue
                 if self.try_reidentify_track(detection, now_sec):
                     continue
                 self.create_track(detection, now_sec)
 
-        self.remove_deleted_tracks()
+        self.suppress_lost_tracks_shadowed_by_confirmed_tracks()
+        self.remove_deleted_tracks(now_sec)
         return self.get_publishable_detections()
 
     def match_tracks_to_detections(
@@ -421,7 +346,7 @@ class TrackStabilizer:
         self.next_track_id += 1
         self.tracks.append(track)
 
-    def remove_deleted_tracks(self) -> None:
+    def remove_deleted_tracks(self, now_sec: float) -> None:
         active_tracks: list[RackTrack] = []
         for track in self.tracks:
             if track.state == self.STATE_DELETED:
@@ -429,10 +354,7 @@ class TrackStabilizer:
             else:
                 active_tracks.append(track)
         self.tracks = active_tracks
-        latest_update_sec = max(
-            [track.last_update_sec for track in self.tracks] + [track.last_update_sec for track in self.recently_deleted_tracks] + [0.0]
-        )
-        self.prune_recently_deleted_tracks(latest_update_sec)
+        self.prune_recently_deleted_tracks(now_sec)
 
     def get_publishable_detections(self) -> list[RackDetection]:
         publishable_tracks = [
@@ -505,6 +427,63 @@ class TrackStabilizer:
         self.update_matched_track(best_track, detection, now_sec)
         return True
 
+    def try_recover_lost_track(self, detection: RackDetection, now_sec: float) -> bool:
+        best_track: RackTrack | None = None
+        best_cost: float | None = None
+
+        for track in self.tracks:
+            if track.state != self.STATE_LOST:
+                continue
+
+            recovery_cost = self.compute_lost_recovery_cost(track, detection, now_sec)
+            if recovery_cost is None:
+                continue
+
+            if best_cost is None or recovery_cost < best_cost:
+                best_cost = recovery_cost
+                best_track = track
+
+        if best_track is None:
+            return False
+
+        self.update_matched_track(best_track, detection, now_sec)
+        return True
+
+    def compute_lost_recovery_cost(
+        self,
+        track: RackTrack,
+        detection: RackDetection,
+        now_sec: float,
+    ) -> Optional[float]:
+        if detection.class_id != track.class_id:
+            return None
+
+        predicted_center_x, predicted_center_y = self.predict_recent_track_xy(track, now_sec)
+        distance = math.hypot(
+            detection.center_x - predicted_center_x,
+            detection.center_y - predicted_center_y,
+        )
+        distance_gate = max(self.lost_match_distance_m, self.reid_max_distance_m)
+        if distance > distance_gate:
+            return None
+
+        yaw_difference = abs(self.normalize_angle(detection.yaw - track.yaw))
+        yaw_gate = max(self.lost_yaw_gate_rad, self.reid_max_yaw_gate_rad)
+        if yaw_difference > yaw_gate:
+            return None
+
+        size_cost = self.compute_size_cost(track, detection)
+        if size_cost > self.reid_max_size_ratio_delta:
+            return None
+
+        iou = self.oriented_iou_from_corners(track.corners_xy, detection.corners_xy)
+        return (
+            distance / max(distance_gate, 1e-6)
+            + 0.30 * (yaw_difference / max(yaw_gate, 1e-6))
+            + 0.25 * size_cost / max(self.reid_max_size_ratio_delta, 1e-6)
+            + 0.20 * (1.0 - iou)
+        )
+
     def compute_reid_cost(self, track: RackTrack, detection: RackDetection, now_sec: float) -> Optional[float]:
         if detection.class_id != track.class_id:
             return None
@@ -545,6 +524,70 @@ class TrackStabilizer:
             track for track in self.recently_deleted_tracks
             if (now_sec - track.last_update_sec) <= self.max_missed_sec * 2.0
         ]
+
+    def suppress_lost_tracks_shadowed_by_confirmed_tracks(self) -> None:
+        confirmed_tracks = [
+            track for track in self.tracks
+            if track.state == self.STATE_CONFIRMED
+        ]
+
+        if not confirmed_tracks:
+            return
+
+        filtered_tracks: list[RackTrack] = []
+        for track in self.tracks:
+            if track.state != self.STATE_LOST:
+                filtered_tracks.append(track)
+                continue
+
+            if any(
+                self.lost_track_is_shadowed_by_confirmed_track(track, confirmed_track)
+                for confirmed_track in confirmed_tracks
+            ):
+                continue
+
+            filtered_tracks.append(track)
+
+        self.tracks = filtered_tracks
+
+    def lost_track_is_shadowed_by_confirmed_track(
+        self,
+        lost_track: RackTrack,
+        confirmed_track: RackTrack,
+    ) -> bool:
+        if lost_track.class_id != confirmed_track.class_id:
+            return False
+
+        predicted_center_x, predicted_center_y = self.predict_track_xy(lost_track)
+        center_distance = math.hypot(
+            confirmed_track.center_x - predicted_center_x,
+            confirmed_track.center_y - predicted_center_y,
+        )
+        duplicate_distance_gate = min(
+            self.lost_match_distance_m,
+            max(self.match_distance_m, 0.60),
+        )
+        if center_distance > duplicate_distance_gate:
+            return False
+
+        yaw_difference = abs(self.normalize_angle(confirmed_track.yaw - lost_track.yaw))
+        if yaw_difference > max(self.yaw_gate_rad, self.reid_max_yaw_gate_rad):
+            return False
+
+        confirmed_detection = confirmed_track.to_detection()
+        size_cost = self.compute_size_cost(lost_track, confirmed_detection)
+        if size_cost > self.reid_max_size_ratio_delta:
+            return False
+
+        iou = self.oriented_iou_from_corners(lost_track.corners_xy, confirmed_track.corners_xy)
+        max_horizontal_extent = max(
+            lost_track.length,
+            lost_track.width,
+            confirmed_track.length,
+            confirmed_track.width,
+            1e-6,
+        )
+        return iou >= max(self.min_iou * 0.5, 0.10) or center_distance <= 0.35 * max_horizontal_extent
 
     def should_switch_class(self, track: RackTrack, detection: RackDetection) -> bool:
         if detection.class_id == track.class_id:
@@ -602,96 +645,6 @@ class TrackStabilizer:
         return math.atan2(math.sin(angle), math.cos(angle))
 
 
-class PointCloudReader:
-    @staticmethod
-    def to_xyz_array(msg: PointCloud2) -> np.ndarray:
-        if hasattr(point_cloud2, "read_points_numpy"):
-            try:
-                points = point_cloud2.read_points_numpy(
-                    msg,
-                    field_names=("x", "y", "z"),
-                    skip_nans=True,
-                )
-
-                if isinstance(points, np.ndarray):
-                    if points.dtype.names:
-                        xyz = np.vstack((points["x"], points["y"], points["z"])).T
-                    else:
-                        xyz = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-
-                    return PointCloudReader.filter_finite_xyz(xyz)
-            except Exception:
-                pass
-
-        points_iter = point_cloud2.read_points(
-            msg,
-            field_names=("x", "y", "z"),
-            skip_nans=True,
-        )
-
-        xyz = np.asarray([[point[0], point[1], point[2]] for point in points_iter], dtype=np.float32)
-        return PointCloudReader.filter_finite_xyz(xyz)
-
-    @staticmethod
-    def filter_finite_xyz(points: np.ndarray) -> np.ndarray:
-        if points.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
-
-        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-        finite_mask = np.all(np.isfinite(points), axis=1)
-        return points[finite_mask]
-
-
-class BevImageBuilder:
-    def __init__(self, geometry: BevGeometry, density_clip_count: int) -> None:
-        self.geometry = geometry
-        self.density_clip_count = max(int(density_clip_count), 1)
-
-    def build(self, points_xyz: np.ndarray) -> tuple[np.ndarray, dict]:
-        u_values, v_values, filtered_points = self.geometry.points_to_pixels(points_xyz)
-
-        occupancy = np.zeros((self.geometry.height_px, self.geometry.width_px), dtype=np.uint8)
-        height_image = np.zeros_like(occupancy)
-        density_counts = np.zeros((self.geometry.height_px, self.geometry.width_px), dtype=np.uint16)
-
-        if filtered_points.size == 0:
-            image = np.dstack((occupancy, height_image, occupancy))
-            return image, self.build_stats(points_xyz, filtered_points, occupancy, density_counts)
-
-        occupancy[v_values, u_values] = 255
-        np.add.at(density_counts, (v_values, u_values), 1)
-
-        z_min = float(self.geometry.roi_min[2])
-        z_max = float(self.geometry.roi_max[2])
-        z_range = max(z_max - z_min, 1e-6)
-
-        z_normalized = np.clip(((filtered_points[:, 2] - z_min) / z_range) * 255.0, 0.0, 255.0).astype(np.uint8)
-        np.maximum.at(height_image, (v_values, u_values), z_normalized)
-
-        density_normalized = np.clip(
-            (np.log1p(density_counts.astype(np.float32)) / math.log1p(self.density_clip_count)) * 255.0,
-            0.0,
-            255.0,
-        ).astype(np.uint8)
-
-        image = np.dstack((occupancy, height_image, density_normalized))
-        return image, self.build_stats(points_xyz, filtered_points, occupancy, density_counts)
-
-    def build_stats(
-        self,
-        raw_points: np.ndarray,
-        filtered_points: np.ndarray,
-        occupancy: np.ndarray,
-        density_counts: np.ndarray,
-    ) -> dict:
-        return {
-            "points_raw": int(raw_points.shape[0]),
-            "points_in_roi": int(filtered_points.shape[0]),
-            "occupied_pixels": int(np.count_nonzero(occupancy)),
-            "max_density_per_pixel": int(density_counts.max()) if density_counts.size else 0,
-        }
-
-
 class TilePlanner:
     def __init__(self, tile_size_px: int, overlap_ratio: float) -> None:
         self.tile_size_px = int(tile_size_px)
@@ -731,13 +684,18 @@ class TilePlanner:
 class ClassThresholdFilter:
     def __init__(
         self,
+        confidence_threshold: float,
         side_confidence_threshold: float,
         top_confidence_threshold: float,
     ) -> None:
+        self.confidence_threshold = float(confidence_threshold)
         self.side_confidence_threshold = float(side_confidence_threshold)
         self.top_confidence_threshold = float(top_confidence_threshold)
 
     def keep(self, candidate: DetectionCandidate) -> bool:
+        if candidate.confidence < self.confidence_threshold:
+            return False
+
         if candidate.class_id == 0:
             return candidate.confidence >= self.side_confidence_threshold
 
@@ -1003,11 +961,13 @@ class MarkerFactory:
         output_frame: str,
         marker_alpha: float,
         text_marker_enabled: bool,
+        text_marker_include_id: bool,
         marker_lifetime_sec: float,
     ) -> None:
         self.output_frame = output_frame
         self.marker_alpha = float(marker_alpha)
         self.text_marker_enabled = bool(text_marker_enabled)
+        self.text_marker_include_id = bool(text_marker_include_id)
         self.marker_lifetime_sec = max(float(marker_lifetime_sec), 0.0)
 
     def build_marker_array(self, detections: list[RackDetection], stamp) -> MarkerArray:
@@ -1106,12 +1066,17 @@ class MarkerFactory:
         marker.color.b = 1.0
         marker.color.a = 1.0
 
-        marker.text = (
-            f"id {detection.detection_id} "
-            f"{detection.class_name} "
-            f"{detection.track_state} "
-            f"{detection.confidence:.2f}"
+        text_parts = []
+        if self.text_marker_include_id:
+            text_parts.append(f"id {detection.detection_id}")
+        text_parts.extend(
+            [
+                detection.class_name,
+                detection.track_state,
+                f"{detection.confidence:.2f}",
+            ]
         )
+        marker.text = " ".join(text_parts)
         return self.apply_lifetime(marker)
 
 
@@ -1263,6 +1228,7 @@ class YoloObbBevDetectorNode(Node):
             overlap_ratio=self.tile_overlap_ratio,
         )
         self.threshold_filter = ClassThresholdFilter(
+            confidence_threshold=self.confidence_threshold,
             side_confidence_threshold=self.side_confidence_threshold,
             top_confidence_threshold=self.top_confidence_threshold,
         )
@@ -1310,6 +1276,7 @@ class YoloObbBevDetectorNode(Node):
             output_frame=self.output_frame,
             marker_alpha=self.marker_alpha,
             text_marker_enabled=self.text_marker_enabled,
+            text_marker_include_id=self.text_marker_include_id,
             marker_lifetime_sec=self.marker_lifetime_sec,
         )
 
@@ -1355,6 +1322,7 @@ class YoloObbBevDetectorNode(Node):
         )
         self.get_logger().info(
             f"Thresholds: model_conf={self.model_confidence_threshold}, "
+            f"global_conf={self.confidence_threshold}, "
             f"side_conf={self.side_confidence_threshold}, "
             f"top_conf={self.top_confidence_threshold}, "
             f"obb_nms_iou={self.obb_nms_iou_threshold}"
@@ -1389,6 +1357,7 @@ class YoloObbBevDetectorNode(Node):
         self.get_logger().info(
             f"Marker config: alpha={self.marker_alpha:.2f}, "
             f"text_enabled={self.text_marker_enabled}, "
+            f"text_include_id={self.text_marker_include_id}, "
             f"lifetime_sec={self.marker_lifetime_sec:.2f}"
         )
         self.get_logger().info(
@@ -1445,6 +1414,7 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("rack_floor_z", -0.95)
         self.declare_parameter("marker_alpha", 0.35)
         self.declare_parameter("text_marker_enabled", True)
+        self.declare_parameter("text_marker_include_id", True)
         self.declare_parameter("marker_lifetime_sec", 2.5)
 
         self.declare_parameter("track_enabled", True)
@@ -1524,6 +1494,7 @@ class YoloObbBevDetectorNode(Node):
         self.rack_floor_z = float(self.get_parameter("rack_floor_z").value)
         self.marker_alpha = float(self.get_parameter("marker_alpha").value)
         self.text_marker_enabled = bool(self.get_parameter("text_marker_enabled").value)
+        self.text_marker_include_id = bool(self.get_parameter("text_marker_include_id").value)
         self.marker_lifetime_sec = float(self.get_parameter("marker_lifetime_sec").value)
 
         self.track_enabled = bool(self.get_parameter("track_enabled").value)

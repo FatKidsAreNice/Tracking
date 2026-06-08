@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'cloud_transform_merge_node = coldstore_tracking.cloud_transform_merge_node:main',
             'cluster_detector_node = coldstore_tracking.cluster_detector_node:main',
+            'yolo_obb_bev_detector_node = coldstore_tracking.yolo_obb_bev_detector_node:main',
             'track_manager_node = coldstore_tracking.track_manager_node:main',
             'track_overview_gui_node = coldstore_tracking.track_overview_gui_node:main',
             'virtual_scanner_node = coldstore_tracking.virtual_scanner_node:main',

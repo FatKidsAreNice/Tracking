@@ -7,7 +7,15 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from .event_utils import build_assignment_payload, make_string_message, parse_string_message
+from .event_utils import (
+    as_float,
+    as_int,
+    build_assignment_payload,
+    get_payload_dict,
+    get_payload_list,
+    make_string_message,
+    parse_string_message,
+)
 
 
 class IdAssignmentNode(Node):
@@ -41,11 +49,11 @@ class IdAssignmentNode(Node):
 
     def track_state_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
-        tracks = payload.get('tracks', [])
+        tracks = [item for item in get_payload_list(payload, 'tracks') if isinstance(item, dict)]
 
         self.latest_tracks = {}
         for item in tracks:
-            track_id = int(item.get('track_id', 0))
+            track_id = as_int(item.get('track_id', 0))
             if track_id <= 0:
                 continue
             self.latest_tracks[track_id] = item
@@ -57,15 +65,15 @@ class IdAssignmentNode(Node):
         scanner_id = str(payload.get('scanner_id', ''))
         direction = str(payload.get('direction', ''))
         barcode_id = str(payload.get('barcode_id', ''))
-        stamp_sec = float(payload.get('stamp_sec', 0.0))
-        event_track_id = int(payload.get('track_id', 0))
+        stamp_sec = as_float(payload.get('stamp_sec', 0.0))
+        event_track_id = as_int(payload.get('track_id', 0))
 
-        position = payload.get('position', {})
+        position = get_payload_dict(payload, 'position')
         event_position = np.array(
             [
-                float(position.get('x', 0.0)),
-                float(position.get('y', 0.0)),
-                float(position.get('z', 0.0)),
+                as_float(position.get('x', 0.0)),
+                as_float(position.get('y', 0.0)),
+                as_float(position.get('z', 0.0)),
             ],
             dtype=np.float32,
         )
@@ -211,9 +219,9 @@ class IdAssignmentNode(Node):
 
             track_position = np.array(
                 [
-                    float(track.get('x', 0.0)),
-                    float(track.get('y', 0.0)),
-                    float(track.get('z', 0.0)),
+                    as_float(track.get('x', 0.0)),
+                    as_float(track.get('y', 0.0)),
+                    as_float(track.get('z', 0.0)),
                 ],
                 dtype=np.float32,
             )

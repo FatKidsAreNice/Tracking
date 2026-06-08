@@ -55,7 +55,6 @@ cluster_detector_node:
     background_min_occupancy_ratio: 0.35
     background_expansion_voxels: 2
     background_expansion_axes: [1, 1, 1]
-    publish_only_clustered_dynamic: false
 
     # Touched-Fallback:
     # Darf großzügiger sein, aber erzeugt keine sichtbaren Marker
@@ -123,6 +122,7 @@ track_manager_node:
     motion_required_updates: 3
     occluded_timeout_sec: 3.0
     disappeared_retention_sec: 4.0
+    track_marker_lifetime_sec: 2.5
 
     # Normaler Pair-/Regal-Match.
     max_match_distance: 1.00

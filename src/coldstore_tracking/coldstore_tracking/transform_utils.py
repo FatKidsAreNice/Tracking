@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, Mapping, Tuple
 
 import numpy as np
 
@@ -72,16 +72,17 @@ def build_single_sensor_transform(
     return pose_to_matrix(x, y, z, roll, pitch, yaw)
 
 
-def build_sensor_transform_map() -> Dict[str, np.ndarray]:
+def build_sensor_transform_map(sensor_poses: Mapping[str, PoseTuple] | None = None) -> Dict[str, np.ndarray]:
     # Derived from the original simulation world poses.
     # Pose order: x, y, z, roll, pitch, yaw.
-    sensor_poses: Dict[str, PoseTuple] = {
-        'lidar_01/link/s': (-7.7, 3.1, 4.0, 0.0, math.pi, 0.0),
-        'lidar_02/link/s': (0.0, 3.1, 4.0, 0.0, math.pi, 0.0),
-        'lidar_03/link/s': (7.7, 3.1, 4.0, 0.0, math.pi, 0.0),
-        'lidar_04/link/s': (-7.7, -3.1, 4.0, 0.0, math.pi, 0.0),
-        'lidar_05/link/s': (0.0, -3.1, 4.0, 0.0, math.pi, 0.0),
-        'lidar_06/link/s': (7.7, -3.1, 4.0, 0.0, math.pi, 0.0),
-    }
+    if sensor_poses is None:
+        sensor_poses = {
+            'lidar_01/link/s': (-7.7, 3.1, 4.0, 0.0, math.pi, 0.0),
+            'lidar_02/link/s': (0.0, 3.1, 4.0, 0.0, math.pi, 0.0),
+            'lidar_03/link/s': (7.7, 3.1, 4.0, 0.0, math.pi, 0.0),
+            'lidar_04/link/s': (-7.7, -3.1, 4.0, 0.0, math.pi, 0.0),
+            'lidar_05/link/s': (0.0, -3.1, 4.0, 0.0, math.pi, 0.0),
+            'lidar_06/link/s': (7.7, -3.1, 4.0, 0.0, math.pi, 0.0),
+        }
 
     return {frame_name: pose_to_matrix(*pose) for frame_name, pose in sensor_poses.items()}

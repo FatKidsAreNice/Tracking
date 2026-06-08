@@ -9,7 +9,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .event_utils import build_scan_event_payload, make_string_message, parse_string_message
+from .event_utils import as_float, as_int, build_scan_event_payload, get_payload_list, make_string_message, parse_string_message
 
 
 @dataclass(frozen=True)
@@ -84,27 +84,27 @@ class VirtualScannerNode(Node):
 
     def track_state_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
-        tracks = payload.get('tracks', [])
-        stamp_sec = float(payload.get('stamp_sec', 0.0))
+        tracks = [item for item in get_payload_list(payload, 'tracks') if isinstance(item, dict)]
+        stamp_sec = as_float(payload.get('stamp_sec', 0.0))
 
         visible_tracks = [
             item for item in tracks
             if str(item.get('motion_state', '')) in self.SCANNABLE_MOTION_STATES
         ]
-        current_track_ids = {int(item.get('track_id', 0)) for item in visible_tracks}
+        current_track_ids = {as_int(item.get('track_id', 0)) for item in visible_tracks}
 
         for zone in self.zones:
             stale_ids = {track_id for track_id in self.active_tracks_by_zone[zone.scanner_id] if track_id not in current_track_ids}
             self.active_tracks_by_zone[zone.scanner_id] -= stale_ids
 
         for item in visible_tracks:
-            track_id = int(item.get('track_id', 0))
+            track_id = as_int(item.get('track_id', 0))
             barcode_id = str(item.get('barcode_id', ''))
             centroid = np.array(
                 [
-                    float(item.get('x', 0.0)),
-                    float(item.get('y', 0.0)),
-                    float(item.get('z', 0.0)),
+                    as_float(item.get('x', 0.0)),
+                    as_float(item.get('y', 0.0)),
+                    as_float(item.get('z', 0.0)),
                 ],
                 dtype=np.float32,
             )
@@ -143,16 +143,16 @@ class VirtualScannerNode(Node):
 
         event_id = self.generate_event_id(zone.scanner_id)
         payload = build_scan_event_payload(
-        event_id=event_id,
-        scanner_id=zone.scanner_id,
-        direction=zone.direction,
-        barcode_id=barcode_id,
-        stamp_sec=stamp_sec,
-        position_x=float(centroid[0]),
-        position_y=float(centroid[1]),
-        position_z=float(centroid[2]),
-        track_id=int(track_id),
-    )
+            event_id=event_id,
+            scanner_id=zone.scanner_id,
+            direction=zone.direction,
+            barcode_id=barcode_id,
+            stamp_sec=stamp_sec,
+            position_x=float(centroid[0]),
+            position_y=float(centroid[1]),
+            position_z=float(centroid[2]),
+            track_id=int(track_id),
+        )
         self.scan_event_pub.publish(make_string_message(payload))
 
         self.get_logger().info(

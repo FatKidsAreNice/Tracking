@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Any
+from typing import Any, Dict, List
 
 from std_msgs.msg import String
 
@@ -17,7 +17,35 @@ def make_string_message(payload: Dict[str, Any]) -> String:
 def parse_string_message(msg: String) -> Dict[str, Any]:
     if not msg.data:
         return {}
-    return json.loads(msg.data)
+    try:
+        payload = json.loads(msg.data)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def get_payload_dict(payload: Dict[str, Any], key: str) -> Dict[str, Any]:
+    value = payload.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
+def get_payload_list(payload: Dict[str, Any], key: str) -> List[Any]:
+    value = payload.get(key, [])
+    return value if isinstance(value, list) else []
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Dict[str, Any]:
