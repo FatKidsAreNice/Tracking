@@ -35,6 +35,7 @@ class TrackOverviewGuiNode(Node):
         self.declare_parameter('floorplan_offset_x_ratio', 0.0)
         self.declare_parameter('floorplan_offset_y_ratio', 0.0)
         self.declare_parameter('show_lost_tracks', True)
+        self.declare_parameter('show_track_heading_arrows', False)
         self.declare_parameter('refresh_rate_hz', 5.0)
         self.declare_parameter('lookup_mode', 'track_id')
         self.declare_parameter('bev_image_topic', '/detection/bev_image')
@@ -56,6 +57,7 @@ class TrackOverviewGuiNode(Node):
         self.floorplan_offset_x_ratio = clamp_float(self.get_parameter('floorplan_offset_x_ratio').value, -1.0, 1.0, 0.0)
         self.floorplan_offset_y_ratio = clamp_float(self.get_parameter('floorplan_offset_y_ratio').value, -1.0, 1.0, 0.0)
         self.show_lost_tracks = bool(self.get_parameter('show_lost_tracks').value)
+        self.show_track_heading_arrows = bool(self.get_parameter('show_track_heading_arrows').value)
         self.refresh_rate_hz = max(float(self.get_parameter('refresh_rate_hz').value), 1.0)
         self.lookup_mode = str(self.get_parameter('lookup_mode').value).strip() or 'track_id'
         self.bev_image_topic = str(self.get_parameter('bev_image_topic').value)
@@ -100,6 +102,7 @@ class TrackOverviewGuiNode(Node):
             f'auto_trim_rotation_borders={self.auto_trim_rotation_borders}, '
             f'background_mode={self.background_mode}, '
             f'floorplan_fit_mode={self.floorplan_fit_mode}, '
+            f'show_track_heading_arrows={self.show_track_heading_arrows}, '
             f'floorplan_scale={self.floorplan_scale:.3f}, '
             f'floorplan_offset=({self.floorplan_offset_x_ratio:.3f}, {self.floorplan_offset_y_ratio:.3f})'
         )
@@ -358,11 +361,20 @@ class TrackOverviewGuiNode(Node):
             outline = '#111111' if is_selected else ''
             self.canvas.create_oval(x_px - radius, y_px - radius, x_px + radius, y_px + radius, fill=fill, outline=outline, width=2 if is_selected else 0)
 
-            yaw = as_float(track.get('yaw', 0.0)) + self.map_rotation_rad
-            arrow_length = 26 if is_selected else 18
-            arrow_x = x_px + math.cos(yaw) * arrow_length
-            arrow_y = y_px - math.sin(yaw) * arrow_length
-            self.canvas.create_line(x_px, y_px, arrow_x, arrow_y, fill=fill, width=3 if is_selected else 2, arrow=tk.LAST)
+            if self.show_track_heading_arrows:
+                yaw = as_float(track.get('yaw', 0.0)) + self.map_rotation_rad
+                arrow_length = 26 if is_selected else 18
+                arrow_x = x_px + math.cos(yaw) * arrow_length
+                arrow_y = y_px - math.sin(yaw) * arrow_length
+                self.canvas.create_line(
+                    x_px,
+                    y_px,
+                    arrow_x,
+                    arrow_y,
+                    fill=fill,
+                    width=3 if is_selected else 2,
+                    arrow=tk.LAST,
+                )
 
             label_text = self.build_display_label(track)
             self.canvas.create_text(

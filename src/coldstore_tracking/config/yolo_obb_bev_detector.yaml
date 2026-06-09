@@ -109,6 +109,7 @@ track_overview_gui_node:
     floorplan_offset_x_ratio: -0.0200
     floorplan_offset_y_ratio: -0.0350
     show_lost_tracks: true
+    show_track_heading_arrows: false
     refresh_rate_hz: 1.0
     lookup_mode: track_id
     bev_image_topic: /detection/bev_image
@@ -141,6 +142,19 @@ coldstore_api_bridge_node:
     lookup_mode: track_id
     map_roi_min: [-14.5, -15.0]
     map_roi_max: [9.0, 6.0]
+    map_pixels_per_meter: 35.0
+    map_rotation_deg: 0.0
+    auto_trim_rotation_borders: false
+    background_mode: floorplan
+    floorplan_image_path: floorplan_background.png
+    floorplan_rotation_deg: 157.0
+    floorplan_fit_mode: contain
+    floorplan_scale: 1.1400
+    floorplan_offset_x_ratio: -0.0200
+    floorplan_offset_y_ratio: -0.0350
+    show_lost_tracks: true
+    show_track_heading_arrows: false
+    overview_image_include_tracks: false
     highlighted_racks: []
     coldstore_sections_json: "[]"
     scanner_config_json: >-
