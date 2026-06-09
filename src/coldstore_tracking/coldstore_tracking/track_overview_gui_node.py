@@ -14,6 +14,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 from .event_utils import as_float, as_int, get_payload_list, parse_string_message
+from .floorplan_overlay_utils import clamp_float, load_floorplan_image, render_floorplan_background
 
 
 class TrackOverviewGuiNode(Node):
@@ -24,6 +25,15 @@ class TrackOverviewGuiNode(Node):
         self.declare_parameter('map_roi_min', [-14.5, -15.0])
         self.declare_parameter('map_roi_max', [9.0, 6.0])
         self.declare_parameter('map_pixels_per_meter', 35.0)
+        self.declare_parameter('map_rotation_deg', 0.0)
+        self.declare_parameter('auto_trim_rotation_borders', True)
+        self.declare_parameter('background_mode', 'floorplan')
+        self.declare_parameter('floorplan_image_path', 'floorplan_background.png')
+        self.declare_parameter('floorplan_rotation_deg', 180.0)
+        self.declare_parameter('floorplan_fit_mode', 'contain')
+        self.declare_parameter('floorplan_scale', 1.0)
+        self.declare_parameter('floorplan_offset_x_ratio', 0.0)
+        self.declare_parameter('floorplan_offset_y_ratio', 0.0)
         self.declare_parameter('show_lost_tracks', True)
         self.declare_parameter('refresh_rate_hz', 5.0)
         self.declare_parameter('lookup_mode', 'track_id')
@@ -35,6 +45,16 @@ class TrackOverviewGuiNode(Node):
         self.map_roi_min = [float(value) for value in self.get_parameter('map_roi_min').value]
         self.map_roi_max = [float(value) for value in self.get_parameter('map_roi_max').value]
         self.map_pixels_per_meter = float(self.get_parameter('map_pixels_per_meter').value)
+        self.map_rotation_deg = float(self.get_parameter('map_rotation_deg').value)
+        self.map_rotation_rad = math.radians(self.map_rotation_deg)
+        self.auto_trim_rotation_borders = bool(self.get_parameter('auto_trim_rotation_borders').value)
+        self.background_mode = str(self.get_parameter('background_mode').value).strip().lower() or 'bev'
+        self.floorplan_image_path = str(self.get_parameter('floorplan_image_path').value).strip()
+        self.floorplan_rotation_deg = float(self.get_parameter('floorplan_rotation_deg').value)
+        self.floorplan_fit_mode = str(self.get_parameter('floorplan_fit_mode').value).strip().lower() or 'contain'
+        self.floorplan_scale = clamp_float(self.get_parameter('floorplan_scale').value, 0.2, 5.0, 1.0)
+        self.floorplan_offset_x_ratio = clamp_float(self.get_parameter('floorplan_offset_x_ratio').value, -1.0, 1.0, 0.0)
+        self.floorplan_offset_y_ratio = clamp_float(self.get_parameter('floorplan_offset_y_ratio').value, -1.0, 1.0, 0.0)
         self.show_lost_tracks = bool(self.get_parameter('show_lost_tracks').value)
         self.refresh_rate_hz = max(float(self.get_parameter('refresh_rate_hz').value), 1.0)
         self.lookup_mode = str(self.get_parameter('lookup_mode').value).strip() or 'track_id'
@@ -47,6 +67,10 @@ class TrackOverviewGuiNode(Node):
         self.selected_track_id: int | None = None
         self.canvas_padding = 20
         self.latest_bev_image: np.ndarray | None = None
+        self.floorplan_image: np.ndarray | None = load_floorplan_image(
+            self.floorplan_image_path,
+            self.floorplan_rotation_deg,
+        )
         self.bev_photo_image: tk.PhotoImage | None = None
         self.latest_track_stamp_sec = 0.0
         self.latest_bev_stamp_sec = 0.0
@@ -54,6 +78,7 @@ class TrackOverviewGuiNode(Node):
         self.latest_bev_version = 0
         self.rendered_bev_version = -1
         self.rendered_bev_size: tuple[int, int] | None = None
+        self.current_canvas_trim_scale = 1.0
 
         self.create_subscription(String, self.track_state_topic, self.track_state_callback, 10)
         self.create_subscription(Image, self.bev_image_topic, self.bev_image_callback, 10)
@@ -70,7 +95,13 @@ class TrackOverviewGuiNode(Node):
         self.build_ui()
         self.get_logger().info(
             f'track_overview_gui_node started. topic={self.track_state_topic}, '
-            f'bev_image_topic={self.bev_image_topic}, lookup_mode={self.lookup_mode}'
+            f'bev_image_topic={self.bev_image_topic}, lookup_mode={self.lookup_mode}, '
+            f'map_rotation_deg={self.map_rotation_deg:.1f}, '
+            f'auto_trim_rotation_borders={self.auto_trim_rotation_borders}, '
+            f'background_mode={self.background_mode}, '
+            f'floorplan_fit_mode={self.floorplan_fit_mode}, '
+            f'floorplan_scale={self.floorplan_scale:.3f}, '
+            f'floorplan_offset=({self.floorplan_offset_x_ratio:.3f}, {self.floorplan_offset_y_ratio:.3f})'
         )
 
     def build_ui(self) -> None:
@@ -289,6 +320,9 @@ class TrackOverviewGuiNode(Node):
         self.canvas.delete('all')
         canvas_width = max(self.canvas.winfo_width(), 420)
         canvas_height = max(self.canvas.winfo_height(), 420)
+        usable_width = max(canvas_width - 2 * self.canvas_padding, 1)
+        usable_height = max(canvas_height - 2 * self.canvas_padding, 1)
+        self.current_canvas_trim_scale = self.compute_auto_trim_scale(usable_width, usable_height)
 
         self.draw_bev_background(canvas_width, canvas_height)
         self.canvas.create_rectangle(
@@ -324,7 +358,7 @@ class TrackOverviewGuiNode(Node):
             outline = '#111111' if is_selected else ''
             self.canvas.create_oval(x_px - radius, y_px - radius, x_px + radius, y_px + radius, fill=fill, outline=outline, width=2 if is_selected else 0)
 
-            yaw = as_float(track.get('yaw', 0.0))
+            yaw = as_float(track.get('yaw', 0.0)) + self.map_rotation_rad
             arrow_length = 26 if is_selected else 18
             arrow_x = x_px + math.cos(yaw) * arrow_length
             arrow_y = y_px - math.sin(yaw) * arrow_length
@@ -341,7 +375,8 @@ class TrackOverviewGuiNode(Node):
             )
 
     def draw_bev_background(self, canvas_width: int, canvas_height: int) -> None:
-        if not self.show_bev_background or self.latest_bev_image is None:
+        background_image = self.get_background_image()
+        if background_image is None:
             return
 
         target_width = max(canvas_width - 2 * self.canvas_padding, 1)
@@ -349,8 +384,9 @@ class TrackOverviewGuiNode(Node):
         target_size = (target_width, target_height)
 
         if self.rendered_bev_version != self.latest_bev_version or self.rendered_bev_size != target_size:
-            resized_image = cv2.resize(self.latest_bev_image, target_size, interpolation=cv2.INTER_AREA)
-            success, png_buffer = cv2.imencode('.png', cv2.cvtColor(resized_image, cv2.COLOR_RGB2BGR))
+            resized_image = self.render_background_image(background_image, target_size)
+            trimmed_image = self.apply_background_postprocess(resized_image, target_size)
+            success, png_buffer = cv2.imencode('.png', cv2.cvtColor(trimmed_image, cv2.COLOR_RGB2BGR))
             if not success:
                 self.status_var.set('Failed to encode BEV background image.')
                 return
@@ -371,6 +407,46 @@ class TrackOverviewGuiNode(Node):
                 anchor='nw',
                 image=self.bev_photo_image,
             )
+
+    def get_background_image(self) -> np.ndarray | None:
+        if self.background_mode == 'floorplan':
+            return self.floorplan_image
+        if self.show_bev_background:
+            return self.latest_bev_image
+        return None
+
+    def render_background_image(self, image: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
+        if self.background_mode == 'floorplan':
+            return render_floorplan_background(
+                floorplan_image=image,
+                target_size=target_size,
+                scale=self.floorplan_scale,
+                offset_x_ratio=self.floorplan_offset_x_ratio,
+                offset_y_ratio=self.floorplan_offset_y_ratio,
+                fit_mode=self.floorplan_fit_mode,
+            )
+
+        image_height, image_width = image.shape[:2]
+        target_width, target_height = target_size
+        scale = max(
+            target_width / max(image_width, 1),
+            target_height / max(image_height, 1),
+        )
+        scaled_width = max(int(round(image_width * scale)), 1)
+        scaled_height = max(int(round(image_height * scale)), 1)
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        scaled = cv2.resize(image, (scaled_width, scaled_height), interpolation=interpolation)
+
+        x_offset = max((scaled_width - target_width) // 2, 0)
+        y_offset = max((scaled_height - target_height) // 2, 0)
+        return scaled[y_offset:y_offset + target_height, x_offset:x_offset + target_width]
+
+    def apply_background_postprocess(self, image: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
+        if self.background_mode == 'floorplan':
+            return image
+
+        rotated_image = self.rotate_canvas_image(image)
+        return self.auto_trim_rotated_image(rotated_image, target_size)
 
     def draw_overlay_status(self, canvas_width: int, canvas_height: int) -> None:
         delta = self.bev_track_time_delta()
@@ -459,7 +535,88 @@ class TrackOverviewGuiNode(Node):
             return '#7d7d7d'
         return '#cc2222'
 
+    def rotate_canvas_image(self, image: np.ndarray) -> np.ndarray:
+        if abs(self.map_rotation_deg) <= 1e-6:
+            return image
+
+        height, width = image.shape[:2]
+        center = (width * 0.5, height * 0.5)
+        rotation_matrix = cv2.getRotationMatrix2D(center, self.map_rotation_deg, 1.0)
+        return cv2.warpAffine(
+            image,
+            rotation_matrix,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(243, 247, 244),
+        )
+
+    def auto_trim_rotated_image(self, image: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
+        trim_scale = self.compute_auto_trim_scale(target_size[0], target_size[1])
+        if trim_scale >= 0.999:
+            return image
+
+        height, width = image.shape[:2]
+        crop_width = max(int(round(width * trim_scale)), 1)
+        crop_height = max(int(round(height * trim_scale)), 1)
+        x_min = max((width - crop_width) // 2, 0)
+        y_min = max((height - crop_height) // 2, 0)
+        cropped = image[y_min:y_min + crop_height, x_min:x_min + crop_width]
+        return cv2.resize(cropped, target_size, interpolation=cv2.INTER_LINEAR)
+
+    def compute_auto_trim_scale(self, width: int, height: int) -> float:
+        if not self.auto_trim_rotation_borders or abs(self.map_rotation_deg) <= 1e-6:
+            return 1.0
+
+        width = max(int(width), 1)
+        height = max(int(height), 1)
+        mask = np.full((height, width), 255, dtype=np.uint8)
+        center = (width * 0.5, height * 0.5)
+        rotation_matrix = cv2.getRotationMatrix2D(center, self.map_rotation_deg, 1.0)
+        rotated_mask = cv2.warpAffine(
+            mask,
+            rotation_matrix,
+            (width, height),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        low = 0.0
+        high = 1.0
+        for _ in range(18):
+            mid = 0.5 * (low + high)
+            if self.centered_rect_is_valid(rotated_mask, mid):
+                low = mid
+            else:
+                high = mid
+        return max(min(low, 1.0), 0.0)
+
+    @staticmethod
+    def centered_rect_is_valid(mask: np.ndarray, scale: float) -> bool:
+        if scale <= 0.0:
+            return False
+
+        height, width = mask.shape[:2]
+        rect_width = max(int(round(width * scale)), 1)
+        rect_height = max(int(round(height * scale)), 1)
+        x_min = max((width - rect_width) // 2, 0)
+        y_min = max((height - rect_height) // 2, 0)
+        x_max = min(x_min + rect_width - 1, width - 1)
+        y_max = min(y_min + rect_height - 1, height - 1)
+
+        return all(
+            mask[y, x] > 0
+            for x, y in (
+                (x_min, y_min),
+                (x_max, y_min),
+                (x_min, y_max),
+                (x_max, y_max),
+            )
+        )
+
     def world_to_canvas(self, x_world: float, y_world: float, canvas_width: int, canvas_height: int) -> tuple[float, float]:
+        x_world, y_world = self.rotate_world_xy(x_world, y_world)
         min_x, min_y = self.map_roi_min
         max_x, max_y = self.map_roi_max
         usable_width = canvas_width - 2 * self.canvas_padding
@@ -471,9 +628,47 @@ class TrackOverviewGuiNode(Node):
         x_ratio = min(max(x_ratio, 0.0), 1.0)
         y_ratio = min(max(y_ratio, 0.0), 1.0)
 
-        x_px = self.canvas_padding + x_ratio * usable_width
-        y_px = self.canvas_padding + y_ratio * usable_height
+        x_local = x_ratio * usable_width
+        y_local = y_ratio * usable_height
+        x_local, y_local = self.apply_auto_trim_to_point(x_local, y_local, usable_width, usable_height)
+
+        x_px = self.canvas_padding + x_local
+        y_px = self.canvas_padding + y_local
         return x_px, y_px
+
+    def apply_auto_trim_to_point(
+        self,
+        x_local: float,
+        y_local: float,
+        usable_width: float,
+        usable_height: float,
+    ) -> tuple[float, float]:
+        scale = self.current_canvas_trim_scale
+        if scale >= 0.999:
+            return x_local, y_local
+
+        x_offset = (1.0 - scale) * usable_width * 0.5
+        y_offset = (1.0 - scale) * usable_height * 0.5
+        x_trimmed = (x_local - x_offset) / max(scale, 1e-6)
+        y_trimmed = (y_local - y_offset) / max(scale, 1e-6)
+        x_trimmed = min(max(x_trimmed, 0.0), usable_width)
+        y_trimmed = min(max(y_trimmed, 0.0), usable_height)
+        return x_trimmed, y_trimmed
+
+    def rotate_world_xy(self, x_world: float, y_world: float) -> tuple[float, float]:
+        if abs(self.map_rotation_rad) <= 1e-6:
+            return x_world, y_world
+
+        center_x = 0.5 * (self.map_roi_min[0] + self.map_roi_max[0])
+        center_y = 0.5 * (self.map_roi_min[1] + self.map_roi_max[1])
+        delta_x = x_world - center_x
+        delta_y = y_world - center_y
+        cos_angle = math.cos(self.map_rotation_rad)
+        sin_angle = math.sin(self.map_rotation_rad)
+
+        rotated_x = cos_angle * delta_x - sin_angle * delta_y + center_x
+        rotated_y = sin_angle * delta_x + cos_angle * delta_y + center_y
+        return rotated_x, rotated_y
 
     def spin_once(self) -> None:
         if not rclpy.ok():

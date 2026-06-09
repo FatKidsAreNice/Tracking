@@ -297,7 +297,7 @@ class TrackManagerNode(Node):
         self.track_marker_pub = self.create_publisher(MarkerArray, '/tracking/track_markers', 10)
         self.track_state_pub = self.create_publisher(String, '/tracking/track_states', 10)
 
-        self.clear_tracks_srv = self.create_service(track_markers
+        self.clear_tracks_srv = self.create_service(
             Trigger,
             '/tracking/clear_tracks',
             self.clear_tracks,

@@ -9,6 +9,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description() -> LaunchDescription:
     params_file = LaunchConfiguration('params_file')
     launch_gui = LaunchConfiguration('launch_gui')
+    launch_api = LaunchConfiguration('launch_api')
 
     default_params_file = PathJoinSubstitution(
         [FindPackageShare('coldstore_tracking'), 'config', 'yolo_obb_bev_detector.yaml']
@@ -25,6 +26,11 @@ def generate_launch_description() -> LaunchDescription:
                 'launch_gui',
                 default_value='true',
                 description='Start the desktop track overview GUI.',
+            ),
+            DeclareLaunchArgument(
+                'launch_api',
+                default_value='false',
+                description='Start the HTTP API bridge for overview, BEV image and barcode scans.',
             ),
             Node(
                 package='coldstore_tracking',
@@ -47,6 +53,14 @@ def generate_launch_description() -> LaunchDescription:
                 output='screen',
                 parameters=[params_file],
                 condition=IfCondition(launch_gui),
+            ),
+            Node(
+                package='coldstore_tracking',
+                executable='coldstore_api_bridge_node',
+                name='coldstore_api_bridge_node',
+                output='screen',
+                parameters=[params_file],
+                condition=IfCondition(launch_api),
             ),
         ]
     )
