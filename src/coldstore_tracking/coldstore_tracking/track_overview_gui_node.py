@@ -69,10 +69,7 @@ class TrackOverviewGuiNode(Node):
         self.selected_track_id: int | None = None
         self.canvas_padding = 20
         self.latest_bev_image: np.ndarray | None = None
-        self.floorplan_image: np.ndarray | None = load_floorplan_image(
-            self.floorplan_image_path,
-            self.floorplan_rotation_deg,
-        )
+        self.floorplan_image: np.ndarray | None = self.load_floorplan_background_image()
         self.bev_photo_image: tk.PhotoImage | None = None
         self.latest_track_stamp_sec = 0.0
         self.latest_bev_stamp_sec = 0.0
@@ -105,6 +102,12 @@ class TrackOverviewGuiNode(Node):
             f'show_track_heading_arrows={self.show_track_heading_arrows}, '
             f'floorplan_scale={self.floorplan_scale:.3f}, '
             f'floorplan_offset=({self.floorplan_offset_x_ratio:.3f}, {self.floorplan_offset_y_ratio:.3f})'
+        )
+
+    def load_floorplan_background_image(self) -> np.ndarray | None:
+        return load_floorplan_image(
+            self.floorplan_image_path,
+            self.floorplan_rotation_deg + self.map_rotation_deg,
         )
 
     def build_ui(self) -> None:

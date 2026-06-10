@@ -109,8 +109,8 @@ class ColdstoreApiBridgeNode(Node):
         self.latest_bev_stamp_sec = 0.0
         self.latest_bev_png_bytes: bytes | None = None
         self.latest_bev_image: np.ndarray | None = None
-        self.floorplan_image = load_floorplan_image(self.floorplan_image_path, self.floorplan_rotation_deg)
-        self.canvas_padding = 20
+        self.floorplan_image = self.load_floorplan_background_image()
+        self.canvas_padding = 0
 
         self.create_subscription(String, self.track_state_topic, self.track_state_callback, 10)
         self.create_subscription(Image, self.bev_image_topic, self.bev_image_callback, 10)
@@ -124,6 +124,12 @@ class ColdstoreApiBridgeNode(Node):
             f'coldstore_api_bridge_node started. host={self.api_host}, port={self.api_port}, '
             f'track_state_topic={self.track_state_topic}, bev_image_topic={self.bev_image_topic}, '
             f'scan_event_topic={self.scan_event_topic}'
+        )
+
+    def load_floorplan_background_image(self) -> np.ndarray | None:
+        return load_floorplan_image(
+            self.floorplan_image_path,
+            self.floorplan_rotation_deg + self.map_rotation_deg,
         )
 
     def load_integer_list_parameter(self, name: str) -> list[int]:
@@ -180,6 +186,9 @@ class ColdstoreApiBridgeNode(Node):
                 self.send_response(status)
                 self.send_cors_headers()
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
                 self.send_header('Content-Length', str(len(response_body)))
                 self.end_headers()
                 self.wfile.write(response_body)
@@ -188,6 +197,9 @@ class ColdstoreApiBridgeNode(Node):
                 self.send_response(status)
                 self.send_cors_headers()
                 self.send_header('Content-Type', 'image/png')
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
                 self.send_header('Content-Length', str(len(image_bytes)))
                 self.end_headers()
                 self.wfile.write(image_bytes)
@@ -244,9 +256,13 @@ class ColdstoreApiBridgeNode(Node):
         payload['lookup_mode'] = self.lookup_mode
         payload['map_roi_min'] = list(self.map_roi_min)
         payload['map_roi_max'] = list(self.map_roi_max)
+        payload['map_rotation_deg'] = float(self.map_rotation_deg)
         payload['highlighted_racks'] = list(self.highlighted_racks)
         payload['coldstore'] = {'sections': self.coldstore_sections}
-        payload['overview_image_url'] = f'{self.resolve_base_url(handler)}/api/coldstore/overview-image'
+        image_version = int(round(max(float(payload.get('stamp_sec', 0.0)), bev_stamp_sec) * 1000.0))
+        payload['overview_image_url'] = (
+            f'{self.resolve_base_url(handler)}/api/coldstore/overview-image?v={image_version}'
+        )
 
         handler.send_json_response(HTTPStatus.OK, payload)
 
@@ -419,6 +435,7 @@ class ColdstoreApiBridgeNode(Node):
                 offset_x_ratio=self.floorplan_offset_x_ratio,
                 offset_y_ratio=self.floorplan_offset_y_ratio,
                 fit_mode=self.floorplan_fit_mode,
+                background_rgb=(255, 255, 255),
             )
         elif bev_image is not None:
             background = cv2.resize(bev_image, target_size, interpolation=cv2.INTER_AREA)
@@ -428,7 +445,7 @@ class ColdstoreApiBridgeNode(Node):
         if background is None:
             return None
 
-        canvas = np.full((canvas_height, canvas_width, 3), (243, 247, 244), dtype=np.uint8)
+        canvas = np.full((canvas_height, canvas_width, 3), (255, 255, 255), dtype=np.uint8)
         x_start = self.canvas_padding
         y_start = self.canvas_padding
         canvas[y_start:y_start + background.shape[0], x_start:x_start + background.shape[1]] = background

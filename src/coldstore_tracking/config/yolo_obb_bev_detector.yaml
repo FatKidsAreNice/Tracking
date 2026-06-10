@@ -9,6 +9,9 @@ yolo_obb_bev_detector_node:
     roi_min: [-14.5, -15.0, -2.0]
     roi_max: [9.0, 6.0, 3.0]
     resolution_m_per_px: 0.01
+    bev_padding_m: 1.0
+    bev_padding_m_x: 2.0
+    bev_padding_m_y: 0.0
 
     density_clip_count: 12
     min_points_in_roi: 1000
@@ -99,15 +102,15 @@ track_overview_gui_node:
     map_roi_min: [-14.5, -15.0]
     map_roi_max: [9.0, 6.0]
     map_pixels_per_meter: 35.0
-    map_rotation_deg: 0.0
+    map_rotation_deg: 22.0
     auto_trim_rotation_borders: false
     background_mode: floorplan
     floorplan_image_path: floorplan_background.png
-    floorplan_rotation_deg: 157.0
+    floorplan_rotation_deg: 158.0
     floorplan_fit_mode: contain
-    floorplan_scale: 1.1400
-    floorplan_offset_x_ratio: -0.0200
-    floorplan_offset_y_ratio: -0.0350
+    floorplan_scale: 1.0000
+    floorplan_offset_x_ratio: 0.0000
+    floorplan_offset_y_ratio: -0.0100
     show_lost_tracks: true
     show_track_heading_arrows: false
     refresh_rate_hz: 1.0
@@ -128,6 +131,7 @@ floorplan_calibration_tool_node:
     floorplan_scale: 1.0000
     floorplan_offset_x_ratio: 0.0000
     floorplan_offset_y_ratio: 0.0000
+    bev_preview_scale: 1.0000
     overlay_alpha: 0.55
     refresh_rate_hz: 5.0
 
@@ -143,15 +147,15 @@ coldstore_api_bridge_node:
     map_roi_min: [-14.5, -15.0]
     map_roi_max: [9.0, 6.0]
     map_pixels_per_meter: 35.0
-    map_rotation_deg: 0.0
+    map_rotation_deg: 22.0
     auto_trim_rotation_borders: false
     background_mode: floorplan
     floorplan_image_path: floorplan_background.png
-    floorplan_rotation_deg: 157.0
+    floorplan_rotation_deg: 158.0
     floorplan_fit_mode: contain
-    floorplan_scale: 1.1400
-    floorplan_offset_x_ratio: -0.0200
-    floorplan_offset_y_ratio: -0.0350
+    floorplan_scale: 1.0000
+    floorplan_offset_x_ratio: 0.0000
+    floorplan_offset_y_ratio: -0.0100
     show_lost_tracks: true
     show_track_heading_arrows: false
     overview_image_include_tracks: false

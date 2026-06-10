@@ -44,6 +44,23 @@ class BevGeometry:
     ) -> "BevGeometry":
         return BevGeometry.from_values(roi_min, roi_max, resolution_m_per_px)
 
+    def expand_xy(self, padding_x_m: float, padding_y_m: float) -> "BevGeometry":
+        padding_x_m = max(float(padding_x_m), 0.0)
+        padding_y_m = max(float(padding_y_m), 0.0)
+
+        expanded_min = self.roi_min.copy()
+        expanded_max = self.roi_max.copy()
+        expanded_min[0] -= padding_x_m
+        expanded_max[0] += padding_x_m
+        expanded_min[1] -= padding_y_m
+        expanded_max[1] += padding_y_m
+
+        return BevGeometry.from_values(
+            roi_min=expanded_min.tolist(),
+            roi_max=expanded_max.tolist(),
+            resolution_m_per_px=self.resolution_m_per_px,
+        )
+
     def filter_points_to_roi(self, points_xyz: np.ndarray) -> np.ndarray:
         if points_xyz.size == 0:
             return np.empty((0, 3), dtype=np.float32)

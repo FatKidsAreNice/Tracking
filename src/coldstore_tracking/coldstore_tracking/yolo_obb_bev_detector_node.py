@@ -1223,6 +1223,10 @@ class YoloObbBevDetectorNode(Node):
             geometry=self.geometry,
             density_clip_count=self.density_clip_count,
         )
+        self.display_bev_builder = BevImageBuilder(
+            geometry=self.display_geometry,
+            density_clip_count=self.density_clip_count,
+        )
         self.tile_planner = TilePlanner(
             tile_size_px=self.tile_size_px,
             overlap_ratio=self.tile_overlap_ratio,
@@ -1317,6 +1321,15 @@ class YoloObbBevDetectorNode(Node):
             f"@ {self.geometry.resolution_m_per_px:.4f} m/px"
         )
         self.get_logger().info(
+            f"BEV display padding: x={self.bev_padding_m_x:.2f}m, y={self.bev_padding_m_y:.2f}m"
+        )
+        self.get_logger().info(f"Display ROI min: {self.display_geometry.roi_min.tolist()}")
+        self.get_logger().info(f"Display ROI max: {self.display_geometry.roi_max.tolist()}")
+        self.get_logger().info(
+            f"Display BEV image: {self.display_geometry.width_px}x{self.display_geometry.height_px} px "
+            f"@ {self.display_geometry.resolution_m_per_px:.4f} m/px"
+        )
+        self.get_logger().info(
             f"Sliding window: tile_size_px={self.tile_size_px}, "
             f"tile_overlap_ratio={self.tile_overlap_ratio}, imgsz={self.imgsz}"
         )
@@ -1384,6 +1397,9 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("roi_min", [-14.5, -15.0, -2.0])
         self.declare_parameter("roi_max", [9.0, 6.0, 3.0])
         self.declare_parameter("resolution_m_per_px", 0.01)
+        self.declare_parameter("bev_padding_m", 1.0)
+        self.declare_parameter("bev_padding_m_x", 0.0)
+        self.declare_parameter("bev_padding_m_y", 0.0)
 
         self.declare_parameter("density_clip_count", 12)
         self.declare_parameter("min_points_in_roi", 1000)
@@ -1458,11 +1474,20 @@ class YoloObbBevDetectorNode(Node):
         roi_min = [float(value) for value in self.get_parameter("roi_min").value]
         roi_max = [float(value) for value in self.get_parameter("roi_max").value]
         resolution_m_per_px = float(self.get_parameter("resolution_m_per_px").value)
+        self.bev_padding_m = max(float(self.get_parameter("bev_padding_m").value), 0.0)
+        bev_padding_m_x = max(float(self.get_parameter("bev_padding_m_x").value), 0.0)
+        bev_padding_m_y = max(float(self.get_parameter("bev_padding_m_y").value), 0.0)
+        self.bev_padding_m_x = bev_padding_m_x if bev_padding_m_x > 0.0 else self.bev_padding_m
+        self.bev_padding_m_y = bev_padding_m_y if bev_padding_m_y > 0.0 else self.bev_padding_m
 
         self.geometry = BevGeometry.from_values(
             roi_min=roi_min,
             roi_max=roi_max,
             resolution_m_per_px=resolution_m_per_px,
+        )
+        self.display_geometry = self.geometry.expand_xy(
+            padding_x_m=self.bev_padding_m_x,
+            padding_y_m=self.bev_padding_m_y,
         )
 
         self.density_clip_count = int(self.get_parameter("density_clip_count").value)
@@ -1557,13 +1582,23 @@ class YoloObbBevDetectorNode(Node):
 
         points_xyz = PointCloudReader.to_xyz_array(msg)
         bev_image, stats = self.bev_builder.build(points_xyz)
+        display_bev_image = None
+        display_stats = None
+        if self.publish_bev_image:
+            display_bev_image, display_stats = self.display_bev_builder.build(points_xyz)
+        stats["display_points_in_roi"] = int(display_stats["points_in_roi"]) if display_stats is not None else stats["points_in_roi"]
+        stats["display_occupied_pixels"] = (
+            int(display_stats["occupied_pixels"]) if display_stats is not None else stats["occupied_pixels"]
+        )
+        stats["display_image_width_px"] = int(self.display_geometry.width_px)
+        stats["display_image_height_px"] = int(self.display_geometry.height_px)
 
         if stats["points_in_roi"] < self.min_points_in_roi:
             self.get_logger().warn(
                 f"Skipping inference: only {stats['points_in_roi']} ROI points "
                 f"(min_points_in_roi={self.min_points_in_roi})."
             )
-            self.publish_empty(msg.header.stamp, stats)
+            self.publish_empty(msg.header.stamp, stats, display_bev_image)
             return
 
         raw_detections = self.run_inference(bev_image)
@@ -1578,7 +1613,7 @@ class YoloObbBevDetectorNode(Node):
         stats["published_detections"] = len(detections)
         stats["active_tracks"] = len(self.track_stabilizer.tracks) if self.track_enabled else 0
 
-        self.publish_detections(detections, msg.header.stamp, stats, bev_image)
+        self.publish_detections(detections, msg.header.stamp, stats, display_bev_image if display_bev_image is not None else bev_image)
 
         side_count = sum(1 for detection in detections if detection.class_id == 0)
         top_count = sum(1 for detection in detections if detection.class_id == 1)
@@ -1675,8 +1710,8 @@ class YoloObbBevDetectorNode(Node):
 
         return candidates
 
-    def publish_empty(self, stamp, stats: dict) -> None:
-        self.publish_detections([], stamp, stats, None)
+    def publish_empty(self, stamp, stats: dict, bev_image: np.ndarray | None = None) -> None:
+        self.publish_detections([], stamp, stats, bev_image)
 
     def publish_detections(self, detections: list[RackDetection], stamp, stats: dict, bev_image: np.ndarray | None) -> None:
         marker_array = self.marker_factory.build_marker_array(detections, stamp)
