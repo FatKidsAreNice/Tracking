@@ -62,11 +62,13 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             'barcode_id': str(track.barcode_id),
             'class_id': int(track.class_id),
             'class_name': str(track.class_name),
+            'class_label': str(track.class_name),
             'state': str(track.state),
             'motion_state': str(track.motion_state),
             'identity_recovered_count': int(track.identity_recovered_count),
             'identity_confidence': float(track.identity_confidence),
             'identity_state': str(track.identity_state),
+            'marriage_state': str(track.marriage_state),
             'confidence': float(track.confidence),
             'x': float(track.centroid[0]),
             'y': float(track.centroid[1]),
@@ -85,6 +87,7 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             'first_seen_sec': float(track.first_seen_sec),
             'last_seen_sec': float(track.last_seen_sec),
             'last_confirmed_sec': float(track.last_confirmed_sec),
+            'last_seen_age_sec': max(float(stamp_sec) - float(track.last_seen_sec), 0.0),
             'lost_transition_count': int(track.lost_transition_count),
             'occluded_transition_count': int(track.occluded_transition_count),
             'reappeared_count': int(track.reappeared_count),
@@ -95,6 +98,7 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
     return {
         'stamp_sec': float(stamp_sec),
         'frame_id': frame_id,
+        'initialization_mode': False,
         'tracks': items,
     }
 
@@ -131,8 +135,9 @@ def build_assignment_payload(
     barcode_id: str,
     track_id: int,
     stamp_sec: float,
+    mode: str = '',
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         'event_id': str(event_id),
         'scanner_id': str(scanner_id),
         'direction': str(direction),
@@ -140,3 +145,6 @@ def build_assignment_payload(
         'track_id': int(track_id),
         'stamp_sec': float(stamp_sec),
     }
+    if mode:
+        payload['mode'] = str(mode)
+    return payload

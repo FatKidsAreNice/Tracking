@@ -103,6 +103,7 @@ track_manager_node:
     occluded_timeout_sec: 3.0
     disappeared_retention_sec: 4.0
     track_marker_lifetime_sec: 2.5
+    assignment_initialization_duration_sec: 15.0
 
 track_overview_gui_node:
   ros__parameters:
@@ -151,6 +152,7 @@ coldstore_api_bridge_node:
     track_state_topic: /tracking/track_states
     bev_image_topic: /detection/bev_image
     scan_event_topic: /tracking/scan_events
+    id_assignment_topic: /tracking/id_assignments
     lookup_mode: track_id
     map_roi_min: [-14.5, -15.0]
     map_roi_max: [9.0, 6.0]

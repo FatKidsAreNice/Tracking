@@ -48,3 +48,4 @@ class Track:
     identity_confidence: float = 0.0
     identity_state: str = 'new'
     last_strict_identity_match: bool = False
+    marriage_state: str = 'unassigned_new'

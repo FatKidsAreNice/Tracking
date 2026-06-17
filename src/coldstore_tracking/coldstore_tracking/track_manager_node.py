@@ -224,6 +224,10 @@ class TrackManagerNode(Node):
     MOTION_DISAPPEARED = MotionStateLogic.MOTION_DISAPPEARED
     MOTION_NEWLY_APPEARED = MotionStateLogic.MOTION_NEWLY_APPEARED
     ACTIVE_MOTION_STATES = {MOTION_STATIC, MOTION_MOVING, MOTION_NEWLY_APPEARED}
+    ASSIGNMENT_ALLOWED_IDENTITY_STATES = {'direct', 'new', 'recovered_strict'}
+    MARRIAGE_KNOWN_EXISTING = 'known_existing'
+    MARRIAGE_UNASSIGNED_NEW = 'unassigned_new'
+    MARRIAGE_ASSIGNED = 'assigned'
 
     def __init__(self) -> None:
         super().__init__('track_manager_node')
@@ -255,6 +259,7 @@ class TrackManagerNode(Node):
         self.declare_parameter('occluded_timeout_sec', 3.0)
         self.declare_parameter('disappeared_retention_sec', 4.0)
         self.declare_parameter('track_marker_lifetime_sec', 2.5)
+        self.declare_parameter('assignment_initialization_duration_sec', 15.0)
 
         self.target_frame = str(self.get_parameter('target_frame').value)
         self.max_match_distance = float(self.get_parameter('max_match_distance').value)
@@ -283,6 +288,10 @@ class TrackManagerNode(Node):
         self.occluded_timeout_sec = float(self.get_parameter('occluded_timeout_sec').value)
         self.disappeared_retention_sec = float(self.get_parameter('disappeared_retention_sec').value)
         self.track_marker_lifetime_sec = float(self.get_parameter('track_marker_lifetime_sec').value)
+        self.assignment_initialization_duration_sec = max(
+            float(self.get_parameter('assignment_initialization_duration_sec').value),
+            0.0,
+        )
 
         self.motion_logic = MotionStateLogic(
             newly_appeared_hold_sec=self.newly_appeared_hold_sec,
@@ -301,6 +310,8 @@ class TrackManagerNode(Node):
         self.last_stamp_sec = 0.0
         self.last_stamp_msg = None
         self.last_source_frame_id = ''
+        self.initialization_start_sec: float | None = None
+        self.initialization_end_sec: float | None = None
 
         self.centroid_sub = None
         self.touched_centroid_sub = None
@@ -374,10 +385,15 @@ class TrackManagerNode(Node):
             f'disappeared_retention_sec={self.disappeared_retention_sec:.2f}, '
             f'marker_lifetime_sec={self.track_marker_lifetime_sec:.2f}'
         )
+        self.get_logger().info(
+            f'Assignment baseline: initialization_duration_sec='
+            f'{self.assignment_initialization_duration_sec:.2f}'
+        )
 
     def centroid_callback(self, pose_array: PoseArray) -> None:
         detections = self.pose_array_to_detections(pose_array)
         stamp_sec = self.stamp_to_sec(pose_array)
+        self.ensure_initialization_window(stamp_sec)
         self.last_stamp_sec = stamp_sec
         self.last_stamp_msg = pose_array.header.stamp
 
@@ -391,6 +407,7 @@ class TrackManagerNode(Node):
             return
 
         stamp_sec = self.stamp_to_sec(pose_array)
+        self.ensure_initialization_window(stamp_sec)
         self.last_stamp_sec = stamp_sec
         self.last_stamp_msg = pose_array.header.stamp
 
@@ -404,6 +421,7 @@ class TrackManagerNode(Node):
         stamp_data = get_payload_dict(payload, 'stamp')
         stamp_sec = self.stable_stamp_to_sec(stamp_data)
         frame_id = str(payload.get('frame_id', '')).strip()
+        self.ensure_initialization_window(stamp_sec)
 
         self.last_stamp_sec = stamp_sec
         self.last_stamp_msg = Time(
@@ -415,6 +433,18 @@ class TrackManagerNode(Node):
         self.sync_tracks_from_stable_tracks(tracks, stamp_sec, frame_id)
         self.publish_track_markers(self.last_stamp_msg)
         self.publish_track_states(stamp_sec)
+
+    def ensure_initialization_window(self, stamp_sec: float) -> None:
+        if stamp_sec <= 0.0:
+            return
+        if self.initialization_start_sec is not None:
+            return
+        self.initialization_start_sec = stamp_sec
+        self.initialization_end_sec = stamp_sec + self.assignment_initialization_duration_sec
+        self.get_logger().info(
+            f'Assignment initialization window started at {stamp_sec:.3f}s and ends at '
+            f'{self.initialization_end_sec:.3f}s'
+        )
 
     def update_tracks_with_normal_detections(self, detections: List[np.ndarray], stamp_sec: float) -> None:
         if not self.tracks:
@@ -513,6 +543,7 @@ class TrackManagerNode(Node):
             identity_state='new',
             last_strict_identity_match=True,
         )
+        self.update_track_assignment_state(track)
         self.tracks[track.track_id] = track
         self.next_track_id += 1
 
@@ -540,6 +571,7 @@ class TrackManagerNode(Node):
             displacement_m=float(np.linalg.norm(track.centroid - previous_centroid)),
             stamp_sec=stamp_sec,
         )
+        self.update_track_assignment_state(track)
 
     def sync_tracks_from_stable_tracks(self, items: List[dict], stamp_sec: float, frame_id: str) -> None:
         previous_tracks = self.tracks
@@ -816,6 +848,7 @@ class TrackManagerNode(Node):
             track.identity_state = 'lost'
             self.motion_logic.update_lost_motion_state(track, stamp_sec=stamp_sec)
 
+        self.update_track_assignment_state(track)
         return track
 
     def resolve_identity_recoveries(
@@ -999,6 +1032,7 @@ class TrackManagerNode(Node):
             identity_confidence=max(previous_track.identity_confidence * 0.5, 0.0),
             identity_state='disappeared',
             last_strict_identity_match=previous_track.last_strict_identity_match,
+            marriage_state=previous_track.marriage_state,
         )
 
     def build_identity_lost_tracks(
@@ -1102,6 +1136,91 @@ class TrackManagerNode(Node):
         if self.identity_recovery_log_events:
             self.get_logger().info(message)
 
+    def is_initialization_mode(self, stamp_sec: float) -> bool:
+        if self.initialization_end_sec is None:
+            return self.assignment_initialization_duration_sec > 0.0
+        return stamp_sec <= self.initialization_end_sec
+
+    def compute_marriage_state(self, track: Track) -> str:
+        if track.barcode_id.strip():
+            return self.MARRIAGE_ASSIGNED
+
+        first_seen_sec = float(track.first_seen_sec)
+        initialization_end_sec = self.initialization_end_sec
+        if initialization_end_sec is None:
+            return self.MARRIAGE_KNOWN_EXISTING
+        if first_seen_sec <= initialization_end_sec:
+            return self.MARRIAGE_KNOWN_EXISTING
+        return self.MARRIAGE_UNASSIGNED_NEW
+
+    def evaluate_marriage_eligibility(
+        self,
+        track: Track,
+        stamp_sec: float,
+    ) -> tuple[bool, str, list[str]]:
+        blockers: list[str] = []
+        marriage_state = self.compute_marriage_state(track)
+
+        if marriage_state == self.MARRIAGE_KNOWN_EXISTING:
+            blockers.append('known_existing')
+        if marriage_state == self.MARRIAGE_ASSIGNED or track.barcode_id.strip():
+            blockers.append('already_assigned')
+        if track.state == 'lost':
+            blockers.append('track_lost')
+        elif track.state != 'confirmed':
+            blockers.append('not_confirmed')
+
+        if track.motion_state == self.MOTION_MOVING:
+            blockers.append('motion_state_moving')
+        elif track.motion_state in (self.MOTION_OCCLUDED, self.MOTION_DISAPPEARED):
+            blockers.append('track_not_visible')
+        elif track.motion_state != self.MOTION_STATIC:
+            blockers.append('motion_state_moving')
+
+        if track.identity_state == 'recovered_weak':
+            blockers.append('identity_recovered_weak')
+        elif track.identity_state not in self.ASSIGNMENT_ALLOWED_IDENTITY_STATES:
+            blockers.append('identity_not_safe')
+
+        if max(stamp_sec - track.last_seen_sec, 0.0) > max(self.occluded_timeout_sec, 0.0) and 'track_not_visible' not in blockers:
+            blockers.append('track_not_visible')
+
+        if not blockers:
+            return True, 'eligible', []
+
+        unique_blockers = list(dict.fromkeys(blockers))
+        if 'already_assigned' in unique_blockers:
+            reason = 'already_assigned'
+        elif 'known_existing' in unique_blockers:
+            reason = 'known_existing'
+        elif 'track_lost' in unique_blockers:
+            reason = 'track_lost'
+        elif 'track_not_visible' in unique_blockers:
+            reason = 'track_not_visible'
+        elif 'not_confirmed' in unique_blockers:
+            reason = 'not_confirmed'
+        elif 'motion_state_moving' in unique_blockers:
+            reason = 'track_moving'
+        elif 'identity_recovered_weak' in unique_blockers:
+            reason = 'identity_recovered_weak'
+        else:
+            reason = 'identity_not_safe'
+        return False, reason, unique_blockers
+
+    def update_track_assignment_state(self, track: Track) -> None:
+        track.marriage_state = self.compute_marriage_state(track)
+
+    def barcode_in_use(self, barcode_id: str, exclude_track_id: int = 0) -> bool:
+        normalized = barcode_id.strip()
+        if not normalized:
+            return False
+        for track_id, track in self.tracks.items():
+            if track_id == exclude_track_id:
+                continue
+            if track.barcode_id.strip() == normalized:
+                return True
+        return False
+
     def assignment_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
         track_id = as_int(payload.get('track_id', 0))
@@ -1118,12 +1237,36 @@ class TrackManagerNode(Node):
             )
             return
 
+        if self.barcode_in_use(barcode_id, exclude_track_id=track_id):
+            self.get_logger().warning(
+                f'Rejected assignment for T{track_id}: barcode "{barcode_id}" is already active.',
+                throttle_duration_sec=2.0,
+            )
+            return
+
         if track.barcode_id == barcode_id:
             return
 
+        if track.barcode_id.strip() and track.barcode_id != barcode_id:
+            self.get_logger().warning(
+                f'Rejected assignment for T{track_id}: already assigned to "{track.barcode_id}".',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        stamp_sec = self.current_stamp_sec()
+        eligible, reason, blockers = self.evaluate_marriage_eligibility(track, stamp_sec)
+        if not eligible:
+            self.get_logger().warning(
+                f'Rejected assignment for T{track_id}: reason={reason}, blockers={blockers}.',
+                throttle_duration_sec=2.0,
+            )
+            return
+
         track.barcode_id = barcode_id
+        self.update_track_assignment_state(track)
         self.get_logger().info(f'Assigned barcode "{barcode_id}" to track T{track_id}.')
-        self.publish_track_states(self.current_stamp_sec())
+        self.publish_track_states(stamp_sec)
         self.publish_track_markers(self.current_stamp_msg())
 
     def remove_track_callback(self, msg: String) -> None:
@@ -1161,6 +1304,8 @@ class TrackManagerNode(Node):
         self.tracks.clear()
         self.identity_lost_tracks.clear()
         self.next_track_id = 1
+        self.initialization_start_sec = None
+        self.initialization_end_sec = None
         response.success = True
         response.message = 'All tracks cleared.'
         self.get_logger().info(response.message)
@@ -1170,6 +1315,22 @@ class TrackManagerNode(Node):
 
     def publish_track_states(self, stamp_sec: float) -> None:
         payload = build_track_states_payload(self.tracks, stamp_sec)
+        payload['initialization_mode'] = self.is_initialization_mode(stamp_sec)
+        if self.initialization_end_sec is not None:
+            payload['initialization_end_sec'] = float(self.initialization_end_sec)
+        for item in payload.get('tracks', []):
+            if not isinstance(item, dict):
+                continue
+            track_id = as_int(item.get('track_id', 0))
+            track = self.tracks.get(track_id)
+            if track is None:
+                continue
+            track.marriage_state = self.compute_marriage_state(track)
+            eligible, reason, blockers = self.evaluate_marriage_eligibility(track, stamp_sec)
+            item['marriage_state'] = track.marriage_state
+            item['is_marriage_eligible'] = bool(eligible)
+            item['eligibility_reason'] = reason
+            item['eligibility_blockers'] = blockers
         self.track_state_pub.publish(make_string_message(payload))
 
     def publish_track_markers(self, stamp) -> None:

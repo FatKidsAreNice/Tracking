@@ -23,6 +23,7 @@ from std_msgs.msg import String
 from .event_utils import (
     as_float,
     as_int,
+    build_assignment_payload,
     build_scan_event_payload,
     get_payload_list,
     make_string_message,
@@ -41,6 +42,7 @@ class ColdstoreApiBridgeNode(Node):
         self.declare_parameter('track_state_topic', '/tracking/track_states')
         self.declare_parameter('bev_image_topic', '/detection/bev_image')
         self.declare_parameter('scan_event_topic', '/tracking/scan_events')
+        self.declare_parameter('id_assignment_topic', '/tracking/id_assignments')
         self.declare_parameter('lookup_mode', 'track_id')
         self.declare_parameter('map_roi_min', [-14.5, -15.0])
         self.declare_parameter('map_roi_max', [9.0, 6.0])
@@ -77,6 +79,7 @@ class ColdstoreApiBridgeNode(Node):
         self.track_state_topic = str(self.get_parameter('track_state_topic').value)
         self.bev_image_topic = str(self.get_parameter('bev_image_topic').value)
         self.scan_event_topic = str(self.get_parameter('scan_event_topic').value)
+        self.id_assignment_topic = str(self.get_parameter('id_assignment_topic').value)
         self.lookup_mode = str(self.get_parameter('lookup_mode').value).strip() or 'track_id'
         self.map_roi_min = [float(value) for value in self.get_parameter('map_roi_min').value]
         self.map_roi_max = [float(value) for value in self.get_parameter('map_roi_max').value]
@@ -115,6 +118,7 @@ class ColdstoreApiBridgeNode(Node):
         self.create_subscription(String, self.track_state_topic, self.track_state_callback, 10)
         self.create_subscription(Image, self.bev_image_topic, self.bev_image_callback, 10)
         self.scan_event_pub = self.create_publisher(String, self.scan_event_topic, 10)
+        self.id_assignment_pub = self.create_publisher(String, self.id_assignment_topic, 10)
 
         self.http_server = self.create_http_server()
         self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
@@ -179,6 +183,9 @@ class ColdstoreApiBridgeNode(Node):
                 if parsed.path in ('/barcode-scan', '/api/coldstore/barcode-scan'):
                     node.handle_barcode_scan_request(self)
                     return
+                if parsed.path in ('/track-marriages', '/api/coldstore/track-marriages'):
+                    node.handle_track_marriage_request(self)
+                    return
                 self.send_error_response(HTTPStatus.NOT_FOUND, 'Endpoint not found.')
 
             def send_json_response(self, status: int, payload: Dict[str, Any]) -> None:
@@ -223,6 +230,8 @@ class ColdstoreApiBridgeNode(Node):
         normalized_payload = {
             'stamp_sec': float(payload.get('stamp_sec', 0.0)),
             'frame_id': str(payload.get('frame_id', '')),
+            'initialization_mode': bool(payload.get('initialization_mode', False)),
+            'initialization_end_sec': float(payload.get('initialization_end_sec', 0.0)),
             'tracks': tracks,
         }
         with self.data_lock:
@@ -249,7 +258,7 @@ class ColdstoreApiBridgeNode(Node):
 
     def handle_overview_request(self, handler: BaseHTTPRequestHandler) -> None:
         with self.data_lock:
-            payload = deepcopy(self.latest_track_payload)
+            payload = self.enrich_track_payload(deepcopy(self.latest_track_payload))
             bev_stamp_sec = float(self.latest_bev_stamp_sec)
 
         payload['bev_stamp_sec'] = bev_stamp_sec
@@ -265,6 +274,92 @@ class ColdstoreApiBridgeNode(Node):
         )
 
         handler.send_json_response(HTTPStatus.OK, payload)
+
+    def handle_track_marriage_request(self, handler: BaseHTTPRequestHandler) -> None:
+        content_length = int(handler.headers.get('Content-Length', '0') or '0')
+        if content_length <= 0:
+            handler.send_error_response(HTTPStatus.BAD_REQUEST, 'Request body is required.')
+            return
+
+        try:
+            request_body = handler.rfile.read(content_length)
+            payload = json.loads(request_body.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            handler.send_error_response(HTTPStatus.BAD_REQUEST, 'Request body must be valid JSON.')
+            return
+
+        if not isinstance(payload, dict):
+            handler.send_error_response(HTTPStatus.BAD_REQUEST, 'JSON body must be an object.')
+            return
+
+        track_id = as_int(payload.get('track_id', 0))
+        uid = str(payload.get('uid') or payload.get('barcode_id') or '').strip()
+        mode = str(payload.get('mode') or 'manual_overview_assignment').strip() or 'manual_overview_assignment'
+        if track_id <= 0:
+            handler.send_json_response(
+                HTTPStatus.BAD_REQUEST,
+                {'success': False, 'reason': 'invalid_track_id', 'message': 'track_id is required.'},
+            )
+            return
+        if not uid:
+            handler.send_json_response(
+                HTTPStatus.BAD_REQUEST,
+                {'success': False, 'reason': 'invalid_uid', 'message': 'uid is required.'},
+            )
+            return
+
+        with self.data_lock:
+            enriched_payload = self.enrich_track_payload(deepcopy(self.latest_track_payload))
+
+        track = self.find_track_by_id(enriched_payload, track_id)
+        if track is None:
+            handler.send_json_response(
+                HTTPStatus.NOT_FOUND,
+                {'success': False, 'reason': 'track_not_found', 'message': f'Track T{track_id} does not exist.'},
+            )
+            return
+
+        conflict_track_id = self.find_track_by_barcode(enriched_payload, uid, exclude_track_id=track_id)
+        if conflict_track_id is not None:
+            handler.send_json_response(
+                HTTPStatus.CONFLICT,
+                {
+                    'success': False,
+                    'reason': 'uid_already_assigned',
+                    'message': f'UID {uid} is already assigned to track T{conflict_track_id}.',
+                },
+            )
+            return
+
+        eligible, reason, message = self.validate_track_marriage(track)
+        if not eligible:
+            handler.send_json_response(
+                HTTPStatus.CONFLICT,
+                {'success': False, 'reason': reason, 'message': message},
+            )
+            return
+
+        assignment_payload = build_assignment_payload(
+            event_id=f'marriage-{uuid.uuid4().hex[:12]}',
+            scanner_id=mode,
+            direction='entry',
+            barcode_id=uid,
+            track_id=track_id,
+            stamp_sec=as_float(enriched_payload.get('stamp_sec', time.time())),
+            mode=mode,
+        )
+        self.id_assignment_pub.publish(make_string_message(assignment_payload))
+
+        handler.send_json_response(
+            HTTPStatus.OK,
+            {
+                'success': True,
+                'message': f'UID {uid} wurde Track T{track_id} zugeordnet.',
+                'track_id': track_id,
+                'uid': uid,
+                'marriage_state': 'assigned',
+            },
+        )
 
     def handle_overview_image_request(self, handler: BaseHTTPRequestHandler) -> None:
         with self.data_lock:
@@ -371,6 +466,188 @@ class ColdstoreApiBridgeNode(Node):
             return datetime.fromisoformat(scanned_at.replace('Z', '+00:00')).timestamp()
         except ValueError:
             return time.time()
+
+    def enrich_track_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        stamp_sec = as_float(payload.get('stamp_sec', 0.0), default=time.time())
+        tracks = [track for track in get_payload_list(payload, 'tracks') if isinstance(track, dict)]
+        payload['tracks'] = [self.enrich_track_item(track, stamp_sec) for track in tracks]
+        return payload
+
+    def enrich_track_item(self, track: Dict[str, Any], stamp_sec: float) -> Dict[str, Any]:
+        enriched = dict(track)
+        x = as_float(enriched.get('x', 0.0))
+        y = as_float(enriched.get('y', 0.0))
+        zone_label, zone_allowed = self.resolve_zone_for_track(x, y)
+        position_label = f'x={x:.2f} y={y:.2f}'
+        blockers = list(enriched.get('eligibility_blockers', []))
+        if not isinstance(blockers, list):
+            blockers = []
+        blockers = [str(item) for item in blockers]
+
+        if not zone_allowed:
+            blockers.append('outside_storage_zone')
+
+        eligible = bool(enriched.get('is_marriage_eligible', False)) and zone_allowed
+        reason = str(enriched.get('eligibility_reason', ''))
+        if not eligible:
+            blockers = list(dict.fromkeys(blockers))
+            if 'outside_storage_zone' in blockers:
+                reason = 'outside_storage_zone'
+            elif not reason:
+                reason = 'track_not_eligible'
+        else:
+            blockers = []
+            reason = 'eligible'
+
+        enriched['class_label'] = str(enriched.get('class_label') or enriched.get('class_name') or '')
+        enriched['zone_label'] = zone_label
+        enriched['position_label'] = position_label
+        enriched['last_seen_age_sec'] = max(
+            stamp_sec - as_float(enriched.get('last_seen_sec', stamp_sec)),
+            0.0,
+        )
+        enriched['eligibility_blockers'] = blockers
+        enriched['eligibility_reason'] = reason
+        enriched['is_marriage_eligible'] = eligible
+        return enriched
+
+    def resolve_zone_for_track(self, x: float, y: float) -> tuple[str, bool]:
+        valid_sections = [section for section in self.coldstore_sections if isinstance(section, dict)]
+        if not valid_sections:
+            return '', True
+
+        for section in valid_sections:
+            if not self.point_in_section(x, y, section):
+                continue
+            label = str(
+                section.get('label')
+                or section.get('name')
+                or section.get('section_label')
+                or ''
+            ).strip()
+            return label, self.section_allows_marriage(section)
+
+        return '', False
+
+    def point_in_section(self, x: float, y: float, section: Dict[str, Any]) -> bool:
+        polygon = section.get('polygon')
+        if isinstance(polygon, list):
+            points = self.parse_polygon_points(polygon)
+            if len(points) >= 3:
+                return self.point_in_polygon(x, y, points)
+
+        bounds = self.parse_section_bounds(section)
+        if bounds is None:
+            return False
+        min_x, min_y, max_x, max_y = bounds
+        return min_x <= x <= max_x and min_y <= y <= max_y
+
+    def parse_section_bounds(self, section: Dict[str, Any]) -> tuple[float, float, float, float] | None:
+        roi_min = section.get('roi_min')
+        roi_max = section.get('roi_max')
+        if isinstance(roi_min, list) and isinstance(roi_max, list) and len(roi_min) >= 2 and len(roi_max) >= 2:
+            return (
+                float(min(roi_min[0], roi_max[0])),
+                float(min(roi_min[1], roi_max[1])),
+                float(max(roi_min[0], roi_max[0])),
+                float(max(roi_min[1], roi_max[1])),
+            )
+
+        min_x = section.get('min_x', section.get('x_min'))
+        min_y = section.get('min_y', section.get('y_min'))
+        max_x = section.get('max_x', section.get('x_max'))
+        max_y = section.get('max_y', section.get('y_max'))
+        if None not in (min_x, min_y, max_x, max_y):
+            return (
+                float(min(min_x, max_x)),
+                float(min(min_y, max_y)),
+                float(max(min_x, max_x)),
+                float(max(min_y, max_y)),
+            )
+        return None
+
+    def parse_polygon_points(self, polygon: list[Any]) -> list[tuple[float, float]]:
+        points: list[tuple[float, float]] = []
+        for item in polygon:
+            if isinstance(item, dict) and 'x' in item and 'y' in item:
+                points.append((float(item['x']), float(item['y'])))
+                continue
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                points.append((float(item[0]), float(item[1])))
+        return points
+
+    @staticmethod
+    def point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
+        inside = False
+        point_count = len(polygon)
+        for index in range(point_count):
+            x1, y1 = polygon[index]
+            x2, y2 = polygon[(index + 1) % point_count]
+            intersects = ((y1 > y) != (y2 > y)) and (
+                x < (x2 - x1) * (y - y1) / max(y2 - y1, 1e-9) + x1
+            )
+            if intersects:
+                inside = not inside
+        return inside
+
+    @staticmethod
+    def section_allows_marriage(section: Dict[str, Any]) -> bool:
+        if 'marriage_allowed' in section:
+            return bool(section.get('marriage_allowed'))
+        if 'assignment_allowed' in section:
+            return bool(section.get('assignment_allowed'))
+        if 'is_storage_zone' in section:
+            return bool(section.get('is_storage_zone'))
+        if 'storage_zone' in section:
+            return bool(section.get('storage_zone'))
+        return True
+
+    @staticmethod
+    def find_track_by_id(payload: Dict[str, Any], track_id: int) -> Dict[str, Any] | None:
+        for track in get_payload_list(payload, 'tracks'):
+            if not isinstance(track, dict):
+                continue
+            if as_int(track.get('track_id', 0)) == track_id:
+                return track
+        return None
+
+    @staticmethod
+    def find_track_by_barcode(
+        payload: Dict[str, Any],
+        barcode_id: str,
+        exclude_track_id: int = 0,
+    ) -> int | None:
+        normalized = barcode_id.strip()
+        if not normalized:
+            return None
+        for track in get_payload_list(payload, 'tracks'):
+            if not isinstance(track, dict):
+                continue
+            track_id = as_int(track.get('track_id', 0))
+            if track_id == exclude_track_id:
+                continue
+            if str(track.get('barcode_id', '')).strip() == normalized:
+                return track_id
+        return None
+
+    @staticmethod
+    def validate_track_marriage(track: Dict[str, Any]) -> tuple[bool, str, str]:
+        if str(track.get('barcode_id', '')).strip():
+            return False, 'uid_already_assigned', 'Track already has a UID.'
+        if str(track.get('marriage_state', '')) != 'unassigned_new':
+            return False, 'track_not_eligible', 'Track is not a new unassigned track.'
+        if not bool(track.get('is_marriage_eligible', False)):
+            return False, 'track_not_eligible', 'Track is moving, unsafe, or outside the allowed zone.'
+        if str(track.get('state', '')) != 'confirmed':
+            return False, 'track_not_eligible', 'Track is not confirmed.'
+        if str(track.get('motion_state', '')) != 'static':
+            return False, 'track_not_eligible', 'Track is moving or not yet static.'
+        if str(track.get('identity_state', '')) not in {'direct', 'new', 'recovered_strict'}:
+            return False, 'track_not_eligible', 'Track identity state is not safe enough.'
+        blockers = track.get('eligibility_blockers', [])
+        if isinstance(blockers, list) and 'outside_storage_zone' in blockers:
+            return False, 'track_not_eligible', 'Track is outside the allowed storage zone.'
+        return True, 'eligible', 'Track is eligible.'
 
     def render_overview_image(self, payload: Dict[str, Any], bev_image: np.ndarray | None) -> np.ndarray | None:
         tracks = [track for track in get_payload_list(payload, 'tracks') if isinstance(track, dict)]

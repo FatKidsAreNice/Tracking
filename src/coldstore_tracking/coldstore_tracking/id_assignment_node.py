@@ -237,6 +237,8 @@ class IdAssignmentNode(Node):
         return best_track_id
 
     def is_assignable_track(self, track: Dict) -> bool:
+        if 'is_marriage_eligible' in track:
+            return bool(track.get('is_marriage_eligible', False))
         motion_state = str(track.get('motion_state', ''))
         return motion_state in self.ASSIGNABLE_MOTION_STATES
 
