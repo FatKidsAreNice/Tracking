@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from builtin_interfaces.msg import Duration
 from builtin_interfaces.msg import Time
 from typing import Dict, List, Tuple
@@ -22,6 +23,32 @@ from .event_utils import (
     parse_string_message,
 )
 from .tracking_types import Track
+
+
+@dataclass(frozen=True)
+class SourceTrackObservation:
+    source_track_id: int
+    state: str
+    class_id: int
+    class_name: str
+    confidence: float
+    center: np.ndarray
+    yaw: float
+    length: float
+    width: float
+    height: float
+    hit_count: int
+    missed_count: int
+    raw_item: dict
+
+
+@dataclass(frozen=True)
+class RecoveryCandidate:
+    track_id: int
+    score: float
+    distance_m: float
+    identity_confidence: float
+    strict_match: bool
 
 
 class MotionStateLogic:
@@ -213,6 +240,14 @@ class TrackManagerNode(Node):
         self.declare_parameter('stable_track_preserve_missing_tracks', False)
         self.declare_parameter('stable_track_publish_disappeared_markers', False)
         self.declare_parameter('stable_track_discontinuity_distance_m', 1.50)
+        self.declare_parameter('identity_recovery_enabled', True)
+        self.declare_parameter('identity_recovery_ttl_sec', 8.0)
+        self.declare_parameter('identity_recovery_gate_m', 0.90)
+        self.declare_parameter('identity_recovery_strict_gate_m', 0.45)
+        self.declare_parameter('identity_recovery_max_ambiguous_score_gap', 0.15)
+        self.declare_parameter('identity_recovery_use_velocity_prediction', True)
+        self.declare_parameter('identity_recovery_log_events', True)
+        self.declare_parameter('identity_preserve_uid_only_on_strict_match', True)
         self.declare_parameter('newly_appeared_hold_sec', 1.5)
         self.declare_parameter('motion_static_threshold_m', 0.03)
         self.declare_parameter('motion_moving_threshold_m', 0.12)
@@ -233,6 +268,14 @@ class TrackManagerNode(Node):
         self.stable_track_preserve_missing_tracks = bool(self.get_parameter('stable_track_preserve_missing_tracks').value)
         self.stable_track_publish_disappeared_markers = bool(self.get_parameter('stable_track_publish_disappeared_markers').value)
         self.stable_track_discontinuity_distance_m = float(self.get_parameter('stable_track_discontinuity_distance_m').value)
+        self.identity_recovery_enabled = bool(self.get_parameter('identity_recovery_enabled').value)
+        self.identity_recovery_ttl_sec = float(self.get_parameter('identity_recovery_ttl_sec').value)
+        self.identity_recovery_gate_m = float(self.get_parameter('identity_recovery_gate_m').value)
+        self.identity_recovery_strict_gate_m = float(self.get_parameter('identity_recovery_strict_gate_m').value)
+        self.identity_recovery_max_ambiguous_score_gap = float(self.get_parameter('identity_recovery_max_ambiguous_score_gap').value)
+        self.identity_recovery_use_velocity_prediction = bool(self.get_parameter('identity_recovery_use_velocity_prediction').value)
+        self.identity_recovery_log_events = bool(self.get_parameter('identity_recovery_log_events').value)
+        self.identity_preserve_uid_only_on_strict_match = bool(self.get_parameter('identity_preserve_uid_only_on_strict_match').value)
         self.newly_appeared_hold_sec = float(self.get_parameter('newly_appeared_hold_sec').value)
         self.motion_static_threshold_m = float(self.get_parameter('motion_static_threshold_m').value)
         self.motion_moving_threshold_m = float(self.get_parameter('motion_moving_threshold_m').value)
@@ -253,6 +296,7 @@ class TrackManagerNode(Node):
         )
 
         self.tracks: Dict[int, Track] = {}
+        self.identity_lost_tracks: Dict[int, Track] = {}
         self.next_track_id = 1
         self.last_stamp_sec = 0.0
         self.last_stamp_msg = None
@@ -311,6 +355,15 @@ class TrackManagerNode(Node):
             f'preserve_missing_tracks={self.stable_track_preserve_missing_tracks}, '
             f'publish_disappeared_markers={self.stable_track_publish_disappeared_markers}, '
             f'discontinuity_distance_m={self.stable_track_discontinuity_distance_m:.2f}'
+        )
+        self.get_logger().info(
+            f'Identity recovery: enabled={self.identity_recovery_enabled}, '
+            f'ttl_sec={self.identity_recovery_ttl_sec:.2f}, '
+            f'gate_m={self.identity_recovery_gate_m:.2f}, '
+            f'strict_gate_m={self.identity_recovery_strict_gate_m:.2f}, '
+            f'ambiguous_gap={self.identity_recovery_max_ambiguous_score_gap:.2f}, '
+            f'use_velocity_prediction={self.identity_recovery_use_velocity_prediction}, '
+            f'preserve_uid_only_on_strict={self.identity_preserve_uid_only_on_strict_match}'
         )
         self.get_logger().info(
             f'Motion logic: hold_sec={self.newly_appeared_hold_sec:.2f}, '
@@ -456,6 +509,9 @@ class TrackManagerNode(Node):
             last_seen_sec=stamp_sec,
             last_confirmed_sec=stamp_sec,
             last_motion_state_change_sec=stamp_sec,
+            identity_confidence=1.0,
+            identity_state='new',
+            last_strict_identity_match=True,
         )
         self.tracks[track.track_id] = track
         self.next_track_id += 1
@@ -487,12 +543,130 @@ class TrackManagerNode(Node):
 
     def sync_tracks_from_stable_tracks(self, items: List[dict], stamp_sec: float, frame_id: str) -> None:
         previous_tracks = self.tracks
+        previous_candidates = self.identity_collect_recovery_candidates(previous_tracks, stamp_sec)
+        observations = self.normalize_stable_track_items(items)
         accepted_tracks: Dict[int, Track] = {}
         accepted_track_ids = set()
+        consumed_source_ids = set()
+
+        source_track_pool = dict(previous_candidates)
+        source_track_pool.update(previous_tracks)
+        source_to_track_id = {
+            track.source_track_id: track_id
+            for track_id, track in source_track_pool.items()
+            if track.source_track_id > 0
+        }
+
+        for observation in observations:
+            previous_track_id = source_to_track_id.get(observation.source_track_id)
+            previous_track = source_track_pool.get(previous_track_id) if previous_track_id is not None else None
+            if previous_track is None:
+                continue
+            if self.stable_track_identity_continuity_broken(
+                previous_track=previous_track,
+                new_position=observation.center,
+                state=observation.state,
+                displacement_m=float(np.linalg.norm(observation.center - previous_track.centroid)),
+            ):
+                continue
+
+            accepted_tracks[previous_track.track_id] = self.build_track_from_observation(
+                observation=observation,
+                persistent_track_id=previous_track.track_id,
+                stamp_sec=stamp_sec,
+                frame_id=frame_id,
+                previous_track=previous_track,
+                identity_state='direct' if observation.state == 'confirmed' else 'lost',
+                identity_confidence=1.0,
+                strict_identity_match=True,
+                preserve_barcode=True,
+            )
+            accepted_track_ids.add(previous_track.track_id)
+            consumed_source_ids.add(observation.source_track_id)
+
+        remaining_observations = [
+            observation
+            for observation in observations
+            if observation.source_track_id not in consumed_source_ids
+        ]
+
+        recovery_matches = self.resolve_identity_recoveries(
+            observations=remaining_observations,
+            candidates=previous_candidates,
+            accepted_track_ids=accepted_track_ids,
+            stamp_sec=stamp_sec,
+        )
+
+        for observation in remaining_observations:
+            match = recovery_matches.get(observation.source_track_id)
+            if match is not None:
+                previous_track = previous_candidates.get(match.track_id)
+                if previous_track is None:
+                    continue
+                preserve_barcode = self.should_preserve_barcode_for_recovery(
+                    previous_track=previous_track,
+                    strict_match=match.strict_match,
+                    accepted_tracks=accepted_tracks,
+                )
+                identity_state = 'recovered_strict' if match.strict_match else 'recovered_weak'
+                accepted_tracks[previous_track.track_id] = self.build_track_from_observation(
+                    observation=observation,
+                    persistent_track_id=previous_track.track_id,
+                    stamp_sec=stamp_sec,
+                    frame_id=frame_id,
+                    previous_track=previous_track,
+                    identity_state=identity_state,
+                    identity_confidence=match.identity_confidence,
+                    strict_identity_match=match.strict_match,
+                    preserve_barcode=preserve_barcode,
+                )
+                accepted_track_ids.add(previous_track.track_id)
+                consumed_source_ids.add(observation.source_track_id)
+                self.log_identity_event(
+                    f'Recovered persistent track T{previous_track.track_id} from source '
+                    f'T{observation.source_track_id}, distance={match.distance_m:.2f}m, '
+                    f'dt={max(stamp_sec - previous_track.last_seen_sec, 0.0):.2f}s'
+                )
+                continue
+
+            new_track = self.build_track_from_observation(
+                observation=observation,
+                persistent_track_id=self.next_track_id,
+                stamp_sec=stamp_sec,
+                frame_id=frame_id,
+                previous_track=None,
+                identity_state='new',
+                identity_confidence=1.0,
+                strict_identity_match=True,
+                preserve_barcode=False,
+            )
+            accepted_tracks[new_track.track_id] = new_track
+            accepted_track_ids.add(new_track.track_id)
+            self.next_track_id += 1
+
+        self.identity_lost_tracks = self.build_identity_lost_tracks(
+            previous_tracks=previous_tracks,
+            previous_candidates=previous_candidates,
+            accepted_track_ids=accepted_track_ids,
+            stamp_sec=stamp_sec,
+            frame_id=frame_id,
+        )
+
+        if self.stable_track_preserve_missing_tracks:
+            for track_id, track in self.identity_lost_tracks.items():
+                accepted_tracks[track_id] = track
+
+        self.tracks = accepted_tracks
+        if self.tracks:
+            self.next_track_id = max(self.next_track_id, max(self.tracks.keys()) + 1)
+
+    def normalize_stable_track_items(self, items: List[dict]) -> List[SourceTrackObservation]:
+        observations: List[SourceTrackObservation] = []
+        seen_source_ids = set()
 
         for item in items:
-            track_id = as_int(item.get('track_id', 0))
-            if track_id <= 0:
+            source_track_id = as_int(item.get('track_id', 0))
+            if source_track_id <= 0 or source_track_id in seen_source_ids:
                 continue
 
             state = str(item.get('state', '')).strip().lower()
@@ -503,103 +677,109 @@ class TrackManagerNode(Node):
             if state not in ('confirmed', 'lost'):
                 continue
 
-            previous_track = previous_tracks.get(track_id)
-            accepted_tracks[track_id] = self.build_track_from_stable_item(
-                item=item,
-                stamp_sec=stamp_sec,
-                frame_id=frame_id,
-                previous_track=previous_track,
+            seen_source_ids.add(source_track_id)
+            observations.append(
+                SourceTrackObservation(
+                    source_track_id=source_track_id,
+                    state=state,
+                    class_id=as_int(item.get('class_id', -1), default=-1),
+                    class_name=str(item.get('class_name', '')),
+                    confidence=as_float(item.get('confidence', 0.0)),
+                    center=np.array(
+                        [
+                            as_float(item.get('center_x', 0.0)),
+                            as_float(item.get('center_y', 0.0)),
+                            as_float(item.get('center_z', 0.0)),
+                        ],
+                        dtype=np.float32,
+                    ),
+                    yaw=as_float(item.get('yaw', 0.0)),
+                    length=as_float(item.get('length', 0.0)),
+                    width=as_float(item.get('width', 0.0)),
+                    height=as_float(item.get('height', 0.0)),
+                    hit_count=max(as_int(item.get('hit_count', 1), default=1), 1),
+                    missed_count=max(as_int(item.get('missed_count', 0), default=0), 0),
+                    raw_item=item,
+                )
             )
-            accepted_track_ids.add(track_id)
 
-        if self.stable_track_preserve_missing_tracks:
-            for track_id, previous_track in previous_tracks.items():
-                if track_id in accepted_track_ids:
-                    continue
+        return observations
 
-                disappeared_track = self.build_disappeared_track(previous_track, stamp_sec, frame_id)
-                if disappeared_track is not None:
-                    accepted_tracks[track_id] = disappeared_track
-
-        self.tracks = accepted_tracks
-        if self.tracks:
-            self.next_track_id = max(self.next_track_id, max(self.tracks.keys()) + 1)
-
-    def build_track_from_stable_item(
+    def build_track_from_observation(
         self,
-        item: dict,
+        observation: SourceTrackObservation,
+        persistent_track_id: int,
         stamp_sec: float,
         frame_id: str,
         previous_track: Track | None,
+        identity_state: str,
+        identity_confidence: float,
+        strict_identity_match: bool,
+        preserve_barcode: bool,
     ) -> Track:
-        position = np.array(
-            [
-                as_float(item.get('center_x', 0.0)),
-                as_float(item.get('center_y', 0.0)),
-                as_float(item.get('center_z', 0.0)),
-            ],
-            dtype=np.float32,
-        )
-        state = str(item.get('state', 'confirmed')).strip().lower()
         velocity = np.zeros(3, dtype=np.float32)
         barcode_id = ''
         previous_motion_state = self.MOTION_NEWLY_APPEARED
         first_seen_sec = stamp_sec
-        last_confirmed_sec = stamp_sec if state == 'confirmed' else 0.0
+        last_confirmed_sec = stamp_sec if observation.state == 'confirmed' else 0.0
         static_streak = 0
         moving_streak = 0
         lost_transition_count = 0
         occluded_transition_count = 0
         reappeared_count = 0
         last_motion_state_change_sec = stamp_sec
-        continuity_broken = False
+        age = max(observation.hit_count, 1)
+        hit_count = max(observation.hit_count, 1)
+        missed_updates = observation.missed_count if observation.state != 'confirmed' else 0
+        source_missed_count = observation.missed_count
+        identity_recovered_count = 0
+        last_source_track_id = observation.source_track_id
 
         if previous_track is not None:
-            displacement_m = float(np.linalg.norm(position - previous_track.centroid))
-            continuity_broken = self.stable_track_identity_continuity_broken(
-                previous_track=previous_track,
-                new_position=position,
-                state=state,
-                displacement_m=displacement_m,
-            )
-
-            if not continuity_broken:
-                dt = max(stamp_sec - previous_track.last_stamp_sec, 1e-3)
-                velocity = ((position - previous_track.centroid) / dt).astype(np.float32)
-                barcode_id = previous_track.barcode_id
-                previous_motion_state = previous_track.motion_state
-                first_seen_sec = previous_track.first_seen_sec or stamp_sec
-                last_confirmed_sec = previous_track.last_confirmed_sec
-                static_streak = previous_track.static_streak
-                moving_streak = previous_track.moving_streak
-                lost_transition_count = previous_track.lost_transition_count
-                occluded_transition_count = previous_track.occluded_transition_count
-                reappeared_count = previous_track.reappeared_count
-                last_motion_state_change_sec = previous_track.last_motion_state_change_sec
+            dt = max(stamp_sec - previous_track.last_stamp_sec, 1e-3)
+            velocity = ((observation.center - previous_track.centroid) / dt).astype(np.float32)
+            barcode_id = previous_track.barcode_id if preserve_barcode else ''
+            previous_motion_state = previous_track.motion_state
+            first_seen_sec = previous_track.first_seen_sec or stamp_sec
+            last_confirmed_sec = previous_track.last_confirmed_sec
+            static_streak = previous_track.static_streak
+            moving_streak = previous_track.moving_streak
+            lost_transition_count = previous_track.lost_transition_count
+            occluded_transition_count = previous_track.occluded_transition_count
+            reappeared_count = previous_track.reappeared_count
+            last_motion_state_change_sec = previous_track.last_motion_state_change_sec
+            age = max(previous_track.age + 1, observation.hit_count, 1)
+            identity_recovered_count = previous_track.identity_recovered_count
+            last_source_track_id = observation.source_track_id
+            if observation.state == 'confirmed':
+                hit_count = max(previous_track.hit_count + 1, observation.hit_count, 1)
+                missed_updates = 0
             else:
-                previous_motion_state = self.MOTION_NEWLY_APPEARED
-                first_seen_sec = stamp_sec
-                last_confirmed_sec = stamp_sec if state == 'confirmed' else 0.0
-                last_motion_state_change_sec = stamp_sec
+                hit_count = max(previous_track.hit_count, observation.hit_count, 1)
+                missed_updates = max(previous_track.missed_updates + 1, observation.missed_count)
+            if identity_state.startswith('recovered'):
+                identity_recovered_count += 1
+                if previous_track.source_track_id > 0:
+                    last_source_track_id = previous_track.source_track_id
 
         track = Track(
-            track_id=as_int(item.get('track_id', 0)),
-            centroid=position,
+            track_id=persistent_track_id,
+            centroid=observation.center.copy(),
             velocity=velocity,
-            age=max(as_int(item.get('hit_count', 1), default=1), 1),
-            missed_updates=as_int(item.get('missed_count', 0)),
+            age=age,
+            missed_updates=missed_updates,
             last_stamp_sec=stamp_sec,
             barcode_id=barcode_id,
-            class_id=as_int(item.get('class_id', -1), default=-1),
-            class_name=str(item.get('class_name', '')),
-            state=state,
-            confidence=as_float(item.get('confidence', 0.0)),
-            yaw=as_float(item.get('yaw', 0.0)),
-            length=as_float(item.get('length', 0.0)),
-            width=as_float(item.get('width', 0.0)),
-            height=as_float(item.get('height', 0.0)),
-            hit_count=as_int(item.get('hit_count', 0)),
-            source_missed_count=as_int(item.get('missed_count', 0)),
+            class_id=observation.class_id,
+            class_name=observation.class_name,
+            state=observation.state,
+            confidence=observation.confidence,
+            yaw=observation.yaw,
+            length=observation.length,
+            width=observation.width,
+            height=observation.height,
+            hit_count=hit_count,
+            source_missed_count=source_missed_count,
             frame_id=frame_id,
             motion_state=previous_motion_state,
             static_streak=static_streak,
@@ -611,14 +791,18 @@ class TrackManagerNode(Node):
             occluded_transition_count=occluded_transition_count,
             reappeared_count=reappeared_count,
             last_motion_state_change_sec=last_motion_state_change_sec,
+            source_track_id=observation.source_track_id,
+            last_source_track_id=last_source_track_id,
+            identity_recovered_count=identity_recovered_count,
+            identity_confidence=max(0.0, min(identity_confidence, 1.0)),
+            identity_state=identity_state,
+            last_strict_identity_match=bool(strict_identity_match),
         )
 
-        if state == 'confirmed':
+        if observation.state == 'confirmed':
             track.last_confirmed_sec = stamp_sec
-            displacement_m = 0.0
-            if previous_track is not None and not continuity_broken:
-                displacement_m = float(np.linalg.norm(position - previous_track.centroid))
-            if previous_track is not None and not continuity_broken and previous_track.state == 'lost':
+            displacement_m = 0.0 if previous_track is None else float(np.linalg.norm(observation.center - previous_track.centroid))
+            if previous_track is not None and (previous_track.state == 'lost' or identity_state.startswith('recovered')):
                 track.reappeared_count += 1
             self.motion_logic.update_confirmed_motion_state(
                 track,
@@ -629,9 +813,133 @@ class TrackManagerNode(Node):
         else:
             if previous_track is None or previous_track.state != 'lost':
                 track.lost_transition_count += 1
+            track.identity_state = 'lost'
             self.motion_logic.update_lost_motion_state(track, stamp_sec=stamp_sec)
 
         return track
+
+    def resolve_identity_recoveries(
+        self,
+        observations: List[SourceTrackObservation],
+        candidates: Dict[int, Track],
+        accepted_track_ids: set[int],
+        stamp_sec: float,
+    ) -> Dict[int, RecoveryCandidate]:
+        if not self.identity_recovery_enabled or self.identity_recovery_gate_m <= 0.0:
+            return {}
+
+        proposals_by_source: Dict[int, List[RecoveryCandidate]] = {}
+        proposals_by_track: Dict[int, List[Tuple[int, RecoveryCandidate]]] = {}
+
+        for observation in observations:
+            if observation.state != 'confirmed':
+                continue
+
+            source_candidates: List[RecoveryCandidate] = []
+            for track_id, candidate_track in candidates.items():
+                if track_id in accepted_track_ids:
+                    continue
+                proposal = self.build_recovery_candidate(
+                    observation=observation,
+                    candidate_track=candidate_track,
+                    stamp_sec=stamp_sec,
+                )
+                if proposal is None:
+                    continue
+                source_candidates.append(proposal)
+                proposals_by_track.setdefault(track_id, []).append((observation.source_track_id, proposal))
+
+            if source_candidates:
+                proposals_by_source[observation.source_track_id] = sorted(source_candidates, key=lambda item: item.score)
+
+        unambiguous_sources: Dict[int, RecoveryCandidate] = {}
+        for source_track_id, source_candidates in proposals_by_source.items():
+            best = source_candidates[0]
+            second = source_candidates[1] if len(source_candidates) > 1 else None
+            if second is not None and (second.score - best.score) < self.identity_recovery_max_ambiguous_score_gap:
+                rejected_ids = f'T{best.track_id}/T{second.track_id}'
+                self.log_identity_event(
+                    f'Rejected recovery for source T{source_track_id}: ambiguous candidates {rejected_ids}'
+                )
+                continue
+            unambiguous_sources[source_track_id] = best
+
+        blocked_track_ids = set()
+        for track_id, candidate_entries in proposals_by_track.items():
+            candidate_entries.sort(key=lambda item: item[1].score)
+            if len(candidate_entries) < 2:
+                continue
+            best_source_id, best = candidate_entries[0]
+            second_source_id, second = candidate_entries[1]
+            if (second.score - best.score) < self.identity_recovery_max_ambiguous_score_gap:
+                blocked_track_ids.add(track_id)
+                self.log_identity_event(
+                    f'Rejected recovery for candidate T{track_id}: ambiguous sources '
+                    f'T{best_source_id}/T{second_source_id}'
+                )
+
+        assignments: Dict[int, RecoveryCandidate] = {}
+        used_track_ids = set()
+        for source_track_id, proposal in sorted(
+            unambiguous_sources.items(),
+            key=lambda item: item[1].score,
+        ):
+            if proposal.track_id in blocked_track_ids or proposal.track_id in used_track_ids:
+                continue
+            assignments[source_track_id] = proposal
+            used_track_ids.add(proposal.track_id)
+
+        return assignments
+
+    def build_recovery_candidate(
+        self,
+        observation: SourceTrackObservation,
+        candidate_track: Track,
+        stamp_sec: float,
+    ) -> RecoveryCandidate | None:
+        if not self.is_class_compatible(observation.class_name, candidate_track.class_name):
+            return None
+
+        dt = max(stamp_sec - candidate_track.last_seen_sec, 0.0)
+        if self.identity_recovery_ttl_sec >= 0.0 and dt > self.identity_recovery_ttl_sec:
+            return None
+
+        predicted_position = candidate_track.centroid
+        if self.identity_recovery_use_velocity_prediction:
+            predicted_position = candidate_track.centroid + candidate_track.velocity * dt
+
+        distance_m = float(np.linalg.norm(observation.center - predicted_position))
+        if distance_m > self.identity_recovery_gate_m:
+            return None
+
+        score = distance_m
+        if observation.length > 0.0 and candidate_track.length > 0.0:
+            score += abs(observation.length - candidate_track.length) * 0.20
+        if observation.width > 0.0 and candidate_track.width > 0.0:
+            score += abs(observation.width - candidate_track.width) * 0.20
+        if observation.height > 0.0 and candidate_track.height > 0.0:
+            score += abs(observation.height - candidate_track.height) * 0.10
+        if observation.yaw != 0.0 or candidate_track.yaw != 0.0:
+            score += self.angular_difference_rad(observation.yaw, candidate_track.yaw) * 0.10
+
+        identity_confidence = max(0.0, 1.0 - min(distance_m / max(self.identity_recovery_gate_m, 1e-6), 1.0))
+        return RecoveryCandidate(
+            track_id=candidate_track.track_id,
+            score=score,
+            distance_m=distance_m,
+            identity_confidence=identity_confidence,
+            strict_match=distance_m <= self.identity_recovery_strict_gate_m,
+        )
+
+    def build_track_from_stable_item(
+        self,
+        item: dict,
+        stamp_sec: float,
+        frame_id: str,
+        previous_track: Track | None,
+    ) -> Track:
+        del item, stamp_sec, frame_id, previous_track
+        raise NotImplementedError('Use build_track_from_observation() for stable-track sync.')
 
     def stable_track_identity_continuity_broken(
         self,
@@ -659,7 +967,7 @@ class TrackManagerNode(Node):
         return Track(
             track_id=previous_track.track_id,
             centroid=previous_track.centroid.copy(),
-            velocity=np.zeros(3, dtype=np.float32),
+            velocity=previous_track.velocity.copy(),
             age=previous_track.age,
             missed_updates=previous_track.missed_updates + 1,
             last_stamp_sec=stamp_sec,
@@ -685,7 +993,114 @@ class TrackManagerNode(Node):
             occluded_transition_count=previous_track.occluded_transition_count,
             reappeared_count=previous_track.reappeared_count,
             last_motion_state_change_sec=previous_track.last_motion_state_change_sec,
+            source_track_id=previous_track.source_track_id,
+            last_source_track_id=previous_track.last_source_track_id or previous_track.source_track_id,
+            identity_recovered_count=previous_track.identity_recovered_count,
+            identity_confidence=max(previous_track.identity_confidence * 0.5, 0.0),
+            identity_state='disappeared',
+            last_strict_identity_match=previous_track.last_strict_identity_match,
         )
+
+    def build_identity_lost_tracks(
+        self,
+        previous_tracks: Dict[int, Track],
+        previous_candidates: Dict[int, Track],
+        accepted_track_ids: set[int],
+        stamp_sec: float,
+        frame_id: str,
+    ) -> Dict[int, Track]:
+        lost_tracks: Dict[int, Track] = {}
+        merged_previous = dict(previous_candidates)
+        merged_previous.update(previous_tracks)
+
+        for track_id, previous_track in merged_previous.items():
+            if track_id in accepted_track_ids:
+                continue
+            disappeared_track = self.build_disappeared_track(previous_track, stamp_sec, frame_id)
+            if disappeared_track is None:
+                continue
+            if self.identity_recovery_ttl_sec >= 0.0:
+                age_sec = stamp_sec - previous_track.last_seen_sec
+                if age_sec > self.identity_recovery_ttl_sec:
+                    continue
+            lost_tracks[track_id] = disappeared_track
+
+        return lost_tracks
+
+    def identity_collect_recovery_candidates(self, previous_tracks: Dict[int, Track], stamp_sec: float) -> Dict[int, Track]:
+        candidates = dict(self.identity_lost_tracks)
+        for track_id, track in previous_tracks.items():
+            if self.identity_recovery_ttl_sec >= 0.0 and (stamp_sec - track.last_seen_sec) > self.identity_recovery_ttl_sec:
+                continue
+            candidates[track_id] = track
+        return candidates
+
+    def should_preserve_barcode_for_recovery(
+        self,
+        previous_track: Track,
+        strict_match: bool,
+        accepted_tracks: Dict[int, Track],
+    ) -> bool:
+        barcode_id = previous_track.barcode_id.strip()
+        if not barcode_id:
+            return True
+        if self.identity_preserve_uid_only_on_strict_match and not strict_match:
+            self.log_identity_event(
+                f'Cleared barcode for T{previous_track.track_id} because recovery was not strict enough'
+            )
+            return False
+        if self.barcode_conflicts_with_active_track(barcode_id, accepted_tracks, previous_track.track_id):
+            self.log_identity_event(
+                f'Cleared barcode for T{previous_track.track_id} because barcode "{barcode_id}" is already active'
+            )
+            return False
+        return True
+
+    def barcode_conflicts_with_active_track(
+        self,
+        barcode_id: str,
+        accepted_tracks: Dict[int, Track],
+        excluded_track_id: int,
+    ) -> bool:
+        if not barcode_id:
+            return False
+        for track_id, track in accepted_tracks.items():
+            if track_id == excluded_track_id:
+                continue
+            if track.barcode_id and track.barcode_id == barcode_id:
+                return True
+        return False
+
+    @staticmethod
+    def rack_group_name(class_name: str) -> str:
+        normalized = class_name.strip().lower()
+        if normalized in {'rack_side_visible', 'rack_top_visible'}:
+            return 'rack'
+        if normalized == 'rack_entrance_visible':
+            return 'rack_entrance_visible'
+        return normalized
+
+    def is_class_compatible(self, first: str, second: str) -> bool:
+        first_group = self.rack_group_name(first)
+        second_group = self.rack_group_name(second)
+        if not first_group or not second_group:
+            return first_group == second_group
+        if first_group == 'rack_entrance_visible' or second_group == 'rack_entrance_visible':
+            return first_group == second_group
+        return first_group == second_group
+
+    @staticmethod
+    def angular_difference_rad(first: float, second: float) -> float:
+        diff = float(first) - float(second)
+        while diff > np.pi:
+            diff -= 2.0 * np.pi
+        while diff < -np.pi:
+            diff += 2.0 * np.pi
+        return abs(diff)
+
+    def log_identity_event(self, message: str) -> None:
+        if self.identity_recovery_log_events:
+            self.get_logger().info(message)
 
     def assignment_callback(self, msg: String) -> None:
         payload = parse_string_message(msg)
@@ -736,6 +1151,7 @@ class TrackManagerNode(Node):
             return
 
         del self.tracks[track_id]
+        self.identity_lost_tracks.pop(track_id, None)
         self.get_logger().info(f'Removed track T{track_id} with barcode "{barcode_id}".')
         self.publish_track_states(self.current_stamp_sec())
         self.publish_track_markers(self.current_stamp_msg())
@@ -743,6 +1159,7 @@ class TrackManagerNode(Node):
     def clear_tracks(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
         self.tracks.clear()
+        self.identity_lost_tracks.clear()
         self.next_track_id = 1
         response.success = True
         response.message = 'All tracks cleared.'

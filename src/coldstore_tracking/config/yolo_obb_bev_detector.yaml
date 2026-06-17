@@ -4,7 +4,7 @@ yolo_obb_bev_detector_node:
     expected_frame_id: rslidar
     output_frame: rslidar
 
-    model_path: /home/edv/ros2_ws/bev_dataset/models/rack_bev_obb_yolo26m_v4m_racksv2_best_epoch40.pt
+    model_path: /home/edv/ros2_ws/bev_dataset/models/rack_bev_obb_yolo26m_v6m_racksv2_plus_racksv3_three_classes_best.pt
 
     roi_min: [-14.5, -15.0, -2.0]
     roi_max: [9.0, 6.0, 3.0]
@@ -88,6 +88,14 @@ track_manager_node:
     stable_track_preserve_missing_tracks: false
     stable_track_publish_disappeared_markers: false
     stable_track_discontinuity_distance_m: 1.50
+    identity_recovery_enabled: true
+    identity_recovery_ttl_sec: 8.0
+    identity_recovery_gate_m: 0.90
+    identity_recovery_strict_gate_m: 0.45
+    identity_recovery_max_ambiguous_score_gap: 0.15
+    identity_recovery_use_velocity_prediction: true
+    identity_recovery_log_events: true
+    identity_preserve_uid_only_on_strict_match: true
     newly_appeared_hold_sec: 1.5
     motion_static_threshold_m: 0.03
     motion_moving_threshold_m: 0.12

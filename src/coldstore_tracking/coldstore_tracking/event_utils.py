@@ -57,11 +57,16 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             frame_id = str(track.frame_id)
         items.append({
             'track_id': int(track.track_id),
+            'source_track_id': int(track.source_track_id),
+            'last_source_track_id': int(track.last_source_track_id),
             'barcode_id': str(track.barcode_id),
             'class_id': int(track.class_id),
             'class_name': str(track.class_name),
             'state': str(track.state),
             'motion_state': str(track.motion_state),
+            'identity_recovered_count': int(track.identity_recovered_count),
+            'identity_confidence': float(track.identity_confidence),
+            'identity_state': str(track.identity_state),
             'confidence': float(track.confidence),
             'x': float(track.centroid[0]),
             'y': float(track.centroid[1]),

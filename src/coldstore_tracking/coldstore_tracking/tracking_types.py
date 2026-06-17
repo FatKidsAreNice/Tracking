@@ -42,3 +42,9 @@ class Track:
     occluded_transition_count: int = 0
     reappeared_count: int = 0
     last_motion_state_change_sec: float = 0.0
+    source_track_id: int = 0
+    last_source_track_id: int = 0
+    identity_recovered_count: int = 0
+    identity_confidence: float = 0.0
+    identity_state: str = 'new'
+    last_strict_identity_match: bool = False
