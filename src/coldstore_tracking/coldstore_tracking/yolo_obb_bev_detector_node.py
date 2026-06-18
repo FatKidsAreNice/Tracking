@@ -76,7 +76,7 @@ class RackDetection:
 
 @dataclass
 class RackTrack:
-    track_id: int
+    internal_track_id: int
     class_id: int
     class_name: str
     confidence: float
@@ -92,14 +92,23 @@ class RackTrack:
     last_seen_sec: float
     last_update_sec: float
     hit_count: int
+    hit_streak: int
     missed_count: int
+    tentative_miss_count: int
     state: str
+    public_track_id: int = 0
     velocity_x: float = 0.0
     velocity_y: float = 0.0
 
+    @property
+    def detection_id(self) -> int:
+        if self.public_track_id > 0:
+            return self.public_track_id
+        return self.internal_track_id
+
     def to_detection(self) -> RackDetection:
         return RackDetection(
-            detection_id=self.track_id,
+            detection_id=self.detection_id,
             class_id=self.class_id,
             class_name=self.class_name,
             confidence=self.confidence,
@@ -130,9 +139,14 @@ class TrackStabilizer:
         min_iou: float,
         max_match_cost: float,
         confirm_hits: int,
+        confirmation_min_hits: int,
+        confirmation_require_consecutive_hits: bool,
+        instant_confirm_enabled: bool,
         instant_confirm_confidence: float,
         max_missed_sec: float,
         tentative_timeout_sec: float,
+        tentative_max_misses: int,
+        publish_tentative_tracks: bool,
         position_alpha: float,
         yaw_alpha: float,
         confidence_alpha: float,
@@ -150,9 +164,14 @@ class TrackStabilizer:
         self.min_iou = float(min_iou)
         self.max_match_cost = float(max_match_cost)
         self.confirm_hits = max(int(confirm_hits), 1)
+        self.confirmation_min_hits = max(int(confirmation_min_hits), 1)
+        self.confirmation_require_consecutive_hits = bool(confirmation_require_consecutive_hits)
+        self.instant_confirm_enabled = bool(instant_confirm_enabled)
         self.instant_confirm_confidence = float(instant_confirm_confidence)
         self.max_missed_sec = float(max_missed_sec)
         self.tentative_timeout_sec = float(tentative_timeout_sec)
+        self.tentative_max_misses = max(int(tentative_max_misses), 0)
+        self.publish_tentative_tracks = bool(publish_tentative_tracks)
         self.position_alpha = float(np.clip(position_alpha, 0.0, 1.0))
         self.yaw_alpha = float(np.clip(yaw_alpha, 0.0, 1.0))
         self.confidence_alpha = float(np.clip(confidence_alpha, 0.0, 1.0))
@@ -167,7 +186,8 @@ class TrackStabilizer:
 
         self.tracks: list[RackTrack] = []
         self.recently_deleted_tracks: list[RackTrack] = []
-        self.next_track_id = 1
+        self.next_internal_track_id = 1
+        self.next_public_track_id = 1
 
     def update(self, detections: list[RackDetection], now_sec: float) -> list[RackDetection]:
         active_track_indices = [
@@ -282,7 +302,9 @@ class TrackStabilizer:
         track.corners_xy = self.smoothed_corners(track, detection)
 
         track.hit_count += 1
+        track.hit_streak += 1
         track.missed_count = 0
+        track.tentative_miss_count = 0
         track.last_seen_sec = now_sec
         track.last_update_sec = now_sec
         dt = max(now_sec - previous_update_sec, 1e-3)
@@ -291,10 +313,20 @@ class TrackStabilizer:
         track.velocity_x = self.ema(track.velocity_x, measured_velocity_x, self.position_alpha)
         track.velocity_y = self.ema(track.velocity_y, measured_velocity_y, self.position_alpha)
 
-        if track.hit_count >= self.confirm_hits or detection.confidence >= self.instant_confirm_confidence:
+        if track.state == self.STATE_LOST:
             track.state = self.STATE_CONFIRMED
-        elif track.state == self.STATE_LOST:
+            return
+
+        if track.state != self.STATE_TENTATIVE:
+            return
+
+        should_confirm = track.hit_streak >= self.confirmation_min_hits
+        if self.instant_confirm_enabled and detection.confidence >= self.instant_confirm_confidence:
+            should_confirm = True
+
+        if should_confirm:
             track.state = self.STATE_CONFIRMED
+            self.assign_public_track_id(track)
 
     def update_unmatched_track(self, track: RackTrack, now_sec: float) -> None:
         track.missed_count += 1
@@ -304,7 +336,10 @@ class TrackStabilizer:
         age_sec = now_sec - track.first_seen_sec
 
         if track.state == self.STATE_TENTATIVE:
-            if age_sec > self.tentative_timeout_sec or track.missed_count > 1:
+            track.tentative_miss_count += 1
+            if self.confirmation_require_consecutive_hits:
+                track.hit_streak = 0
+            if age_sec > self.tentative_timeout_sec or track.tentative_miss_count > self.tentative_max_misses:
                 track.state = self.STATE_DELETED
             return
 
@@ -315,13 +350,8 @@ class TrackStabilizer:
         track.state = self.STATE_LOST
 
     def create_track(self, detection: RackDetection, now_sec: float) -> None:
-        state = self.STATE_TENTATIVE
-
-        if self.confirm_hits <= 1 or detection.confidence >= self.instant_confirm_confidence:
-            state = self.STATE_CONFIRMED
-
         track = RackTrack(
-            track_id=self.next_track_id,
+            internal_track_id=self.next_internal_track_id,
             class_id=detection.class_id,
             class_name=detection.class_name,
             confidence=detection.confidence,
@@ -337,20 +367,30 @@ class TrackStabilizer:
             last_seen_sec=now_sec,
             last_update_sec=now_sec,
             hit_count=1,
+            hit_streak=1,
             missed_count=0,
-            state=state,
+            tentative_miss_count=0,
+            state=self.STATE_TENTATIVE,
+            public_track_id=0,
             velocity_x=0.0,
             velocity_y=0.0,
         )
 
-        self.next_track_id += 1
+        self.next_internal_track_id += 1
+        if self.confirmation_min_hits <= 1:
+            track.state = self.STATE_CONFIRMED
+            self.assign_public_track_id(track)
+        elif self.instant_confirm_enabled and detection.confidence >= self.instant_confirm_confidence:
+            track.state = self.STATE_CONFIRMED
+            self.assign_public_track_id(track)
         self.tracks.append(track)
 
     def remove_deleted_tracks(self, now_sec: float) -> None:
         active_tracks: list[RackTrack] = []
         for track in self.tracks:
             if track.state == self.STATE_DELETED:
-                self.recently_deleted_tracks.append(track)
+                if track.public_track_id > 0:
+                    self.recently_deleted_tracks.append(track)
             else:
                 active_tracks.append(track)
         self.tracks = active_tracks
@@ -360,10 +400,17 @@ class TrackStabilizer:
         publishable_tracks = [
             track for track in self.tracks
             if track.state in (self.STATE_CONFIRMED, self.STATE_LOST)
+            or (self.publish_tentative_tracks and track.state == self.STATE_TENTATIVE)
         ]
 
-        publishable_tracks.sort(key=lambda track: track.track_id)
+        publishable_tracks.sort(key=lambda track: (track.public_track_id <= 0, track.detection_id))
         return [track.to_detection() for track in publishable_tracks]
+
+    def assign_public_track_id(self, track: RackTrack) -> None:
+        if track.public_track_id > 0:
+            return
+        track.public_track_id = self.next_public_track_id
+        self.next_public_track_id += 1
 
     def get_match_distance_gate(self, track: RackTrack) -> float:
         if track.state == self.STATE_LOST:
@@ -419,7 +466,7 @@ class TrackStabilizer:
 
         self.recently_deleted_tracks = [
             track for track in self.recently_deleted_tracks
-            if track.track_id != best_track.track_id
+            if track.internal_track_id != best_track.internal_track_id
         ]
         best_track.state = self.STATE_LOST
         best_track.last_update_sec = now_sec
@@ -962,12 +1009,14 @@ class MarkerFactory:
         marker_alpha: float,
         text_marker_enabled: bool,
         text_marker_include_id: bool,
+        show_tentative_markers: bool,
         marker_lifetime_sec: float,
     ) -> None:
         self.output_frame = output_frame
         self.marker_alpha = float(marker_alpha)
         self.text_marker_enabled = bool(text_marker_enabled)
         self.text_marker_include_id = bool(text_marker_include_id)
+        self.show_tentative_markers = bool(show_tentative_markers)
         self.marker_lifetime_sec = max(float(marker_lifetime_sec), 0.0)
 
     def build_marker_array(self, detections: list[RackDetection], stamp) -> MarkerArray:
@@ -975,7 +1024,8 @@ class MarkerFactory:
         marker_array.markers.extend(self.build_delete_all_markers(stamp))
 
         for detection in detections:
-            marker_array.markers.append(self.build_cube_marker(detection, stamp))
+            if self.should_publish_cube_marker(detection):
+                marker_array.markers.append(self.build_cube_marker(detection, stamp))
 
             if self.should_publish_text_marker(detection):
                 marker_array.markers.append(self.build_text_marker(detection, stamp))
@@ -998,7 +1048,18 @@ class MarkerFactory:
         return marker
 
     def should_publish_text_marker(self, detection: RackDetection) -> bool:
-        return self.text_marker_enabled and detection.track_state != "lost"
+        if not self.text_marker_enabled:
+            return False
+        if detection.track_state == TrackStabilizer.STATE_LOST:
+            return False
+        if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
+            return self.show_tentative_markers
+        return True
+
+    def should_publish_cube_marker(self, detection: RackDetection) -> bool:
+        if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
+            return self.show_tentative_markers
+        return True
 
     def apply_lifetime(self, marker: Marker) -> Marker:
         lifetime_sec = int(self.marker_lifetime_sec)
@@ -1015,7 +1076,7 @@ class MarkerFactory:
         marker = Marker()
         marker.header.frame_id = self.output_frame
         marker.header.stamp = stamp
-        marker.ns = "rack_yolo_obb"
+        marker.ns = self.cube_namespace(detection)
         marker.id = detection.detection_id
         marker.type = Marker.CUBE
         marker.action = Marker.ADD
@@ -1039,7 +1100,9 @@ class MarkerFactory:
             marker.color.g = 0.65
             marker.color.b = 0.0
 
-        if detection.track_state == "lost":
+        if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
+            marker.color.a = self.marker_alpha * 0.25
+        elif detection.track_state == TrackStabilizer.STATE_LOST:
             marker.color.a = self.marker_alpha * 0.45
         else:
             marker.color.a = self.marker_alpha
@@ -1050,7 +1113,7 @@ class MarkerFactory:
         marker = Marker()
         marker.header.frame_id = self.output_frame
         marker.header.stamp = stamp
-        marker.ns = "rack_yolo_obb_text"
+        marker.ns = self.text_namespace(detection)
         marker.id = 10000 + detection.detection_id
         marker.type = Marker.TEXT_VIEW_FACING
         marker.action = Marker.ADD
@@ -1078,6 +1141,18 @@ class MarkerFactory:
         )
         marker.text = " ".join(text_parts)
         return self.apply_lifetime(marker)
+
+    @staticmethod
+    def cube_namespace(detection: RackDetection) -> str:
+        if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
+            return "rack_yolo_obb_tentative"
+        return "rack_yolo_obb"
+
+    @staticmethod
+    def text_namespace(detection: RackDetection) -> str:
+        if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
+            return "rack_yolo_obb_tentative_text"
+        return "rack_yolo_obb_text"
 
 
 class DetectionMessageBuilder:
@@ -1261,9 +1336,14 @@ class YoloObbBevDetectorNode(Node):
             min_iou=self.track_min_iou,
             max_match_cost=self.track_max_match_cost,
             confirm_hits=self.track_confirm_hits,
+            confirmation_min_hits=self.track_confirmation_min_hits,
+            confirmation_require_consecutive_hits=self.track_confirmation_require_consecutive_hits,
+            instant_confirm_enabled=self.track_instant_confirm_enabled,
             instant_confirm_confidence=self.track_instant_confirm_confidence,
             max_missed_sec=self.track_max_missed_sec,
             tentative_timeout_sec=self.track_tentative_timeout_sec,
+            tentative_max_misses=self.tentative_max_misses,
+            publish_tentative_tracks=self.publish_tentative_tracks,
             position_alpha=self.track_position_alpha,
             yaw_alpha=self.track_yaw_alpha,
             confidence_alpha=self.track_confidence_alpha,
@@ -1281,6 +1361,7 @@ class YoloObbBevDetectorNode(Node):
             marker_alpha=self.marker_alpha,
             text_marker_enabled=self.text_marker_enabled,
             text_marker_include_id=self.text_marker_include_id,
+            show_tentative_markers=self.show_tentative_markers,
             marker_lifetime_sec=self.marker_lifetime_sec,
         )
 
@@ -1352,8 +1433,19 @@ class YoloObbBevDetectorNode(Node):
             f"moving_match_distance={self.track_moving_match_distance_m:.2f}m, "
             f"lost_match_distance={self.track_lost_match_distance_m:.2f}m, "
             f"yaw_gate={self.track_yaw_gate_deg:.1f}deg, "
-            f"confirm_hits={self.track_confirm_hits}, "
+            f"min_detection_confidence={self.track_min_detection_confidence:.2f}, "
             f"max_missed_sec={self.track_max_missed_sec:.1f}"
+        )
+        self.get_logger().info(
+            f"Tentative confirmation: legacy_confirm_hits={self.track_confirm_hits}, "
+            f"min_hits={self.track_confirmation_min_hits}, "
+            f"require_consecutive={self.track_confirmation_require_consecutive_hits}, "
+            f"tentative_max_misses={self.tentative_max_misses}, "
+            f"tentative_timeout_sec={self.track_tentative_timeout_sec:.1f}"
+        )
+        self.get_logger().info(
+            f"Instant confirm: enabled={self.track_instant_confirm_enabled}, "
+            f"confidence={self.track_instant_confirm_confidence:.2f}"
         )
         self.get_logger().info(
             f"Track prediction/reid: moving_speed_threshold={self.track_moving_speed_threshold_mps:.2f}m/s, "
@@ -1371,11 +1463,15 @@ class YoloObbBevDetectorNode(Node):
             f"Marker config: alpha={self.marker_alpha:.2f}, "
             f"text_enabled={self.text_marker_enabled}, "
             f"text_include_id={self.text_marker_include_id}, "
+            f"show_tentative_markers={self.show_tentative_markers}, "
             f"lifetime_sec={self.marker_lifetime_sec:.2f}"
         )
         self.get_logger().info(
             f"Stable track output: enabled={self.publish_stable_tracks}, "
             f"topic={self.stable_track_topic}, include_lost={self.stable_track_include_lost}"
+        )
+        self.get_logger().info(
+            f"Tentative debug publication: enabled={self.publish_tentative_tracks}"
         )
         self.get_logger().info(
             f"BEV image output: enabled={self.publish_bev_image}, topic={self.bev_image_topic}"
@@ -1438,10 +1534,15 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("track_yaw_gate_deg", 45.0)
         self.declare_parameter("track_min_iou", 0.02)
         self.declare_parameter("track_max_match_cost", 2.40)
+        self.declare_parameter("track_min_detection_confidence", 0.55)
         self.declare_parameter("track_confirm_hits", 2)
-        self.declare_parameter("track_instant_confirm_confidence", 0.45)
+        self.declare_parameter("track_confirmation_min_hits", 4)
+        self.declare_parameter("track_confirmation_require_consecutive_hits", True)
+        self.declare_parameter("track_instant_confirm_enabled", False)
+        self.declare_parameter("track_instant_confirm_confidence", 0.98)
         self.declare_parameter("track_max_missed_sec", 8.0)
         self.declare_parameter("track_tentative_timeout_sec", 3.0)
+        self.declare_parameter("tentative_max_misses", 1)
         self.declare_parameter("track_position_alpha", 0.25)
         self.declare_parameter("track_yaw_alpha", 0.20)
         self.declare_parameter("track_confidence_alpha", 0.35)
@@ -1460,6 +1561,8 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("stable_track_topic", "/tracking/stable_tracks")
         self.declare_parameter("publish_stable_tracks", True)
         self.declare_parameter("stable_track_include_lost", True)
+        self.declare_parameter("publish_tentative_tracks", False)
+        self.declare_parameter("show_tentative_markers", False)
         self.declare_parameter("bev_image_topic", "/detection/bev_image")
         self.declare_parameter("publish_bev_image", True)
         self.declare_parameter("publish_tracking_centroids", False)
@@ -1527,10 +1630,17 @@ class YoloObbBevDetectorNode(Node):
         self.track_yaw_gate_deg = float(self.get_parameter("track_yaw_gate_deg").value)
         self.track_min_iou = float(self.get_parameter("track_min_iou").value)
         self.track_max_match_cost = float(self.get_parameter("track_max_match_cost").value)
+        self.track_min_detection_confidence = float(self.get_parameter("track_min_detection_confidence").value)
         self.track_confirm_hits = int(self.get_parameter("track_confirm_hits").value)
+        self.track_confirmation_min_hits = int(self.get_parameter("track_confirmation_min_hits").value)
+        self.track_confirmation_require_consecutive_hits = bool(
+            self.get_parameter("track_confirmation_require_consecutive_hits").value
+        )
+        self.track_instant_confirm_enabled = bool(self.get_parameter("track_instant_confirm_enabled").value)
         self.track_instant_confirm_confidence = float(self.get_parameter("track_instant_confirm_confidence").value)
         self.track_max_missed_sec = float(self.get_parameter("track_max_missed_sec").value)
         self.track_tentative_timeout_sec = float(self.get_parameter("track_tentative_timeout_sec").value)
+        self.tentative_max_misses = int(self.get_parameter("tentative_max_misses").value)
         self.track_position_alpha = float(self.get_parameter("track_position_alpha").value)
         self.track_yaw_alpha = float(self.get_parameter("track_yaw_alpha").value)
         self.track_confidence_alpha = float(self.get_parameter("track_confidence_alpha").value)
@@ -1549,6 +1659,8 @@ class YoloObbBevDetectorNode(Node):
         self.stable_track_topic = str(self.get_parameter("stable_track_topic").value)
         self.publish_stable_tracks = bool(self.get_parameter("publish_stable_tracks").value)
         self.stable_track_include_lost = bool(self.get_parameter("stable_track_include_lost").value)
+        self.publish_tentative_tracks = bool(self.get_parameter("publish_tentative_tracks").value)
+        self.show_tentative_markers = bool(self.get_parameter("show_tentative_markers").value)
         self.bev_image_topic = str(self.get_parameter("bev_image_topic").value)
         self.publish_bev_image = bool(self.get_parameter("publish_bev_image").value)
         self.publish_tracking_centroids = bool(self.get_parameter("publish_tracking_centroids").value)
@@ -1605,11 +1717,16 @@ class YoloObbBevDetectorNode(Node):
         self.inference_count += 1
 
         if self.track_enabled:
-            detections = self.track_stabilizer.update(raw_detections, now_sec)
+            trackable_detections = [
+                detection for detection in raw_detections
+                if detection.confidence >= self.track_min_detection_confidence
+            ]
+            detections = self.track_stabilizer.update(trackable_detections, now_sec)
         else:
             detections = raw_detections
 
         stats["raw_detections"] = len(raw_detections)
+        stats["trackable_detections"] = len(trackable_detections) if self.track_enabled else len(raw_detections)
         stats["published_detections"] = len(detections)
         stats["active_tracks"] = len(self.track_stabilizer.tracks) if self.track_enabled else 0
 
@@ -1622,6 +1739,7 @@ class YoloObbBevDetectorNode(Node):
 
         self.get_logger().info(
             f"Inference #{self.inference_count}: raw={len(raw_detections)}, "
+            f"trackable={stats['trackable_detections']}, "
             f"published={len(detections)}, confirmed={confirmed_count}, lost={lost_count}, "
             f"side={side_count}, top={top_count}, "
             f"points_in_roi={stats['points_in_roi']}, occupied_pixels={stats['occupied_pixels']}"

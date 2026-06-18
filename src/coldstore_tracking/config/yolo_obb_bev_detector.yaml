@@ -52,10 +52,15 @@ yolo_obb_bev_detector_node:
     track_yaw_gate_deg: 45.0
     track_min_iou: 0.02
     track_max_match_cost: 2.40
+    track_min_detection_confidence: 0.55
     track_confirm_hits: 2
-    track_instant_confirm_confidence: 0.45
+    track_confirmation_min_hits: 4
+    track_confirmation_require_consecutive_hits: true
+    track_instant_confirm_enabled: false
+    track_instant_confirm_confidence: 0.98
     track_max_missed_sec: 8.0
     track_tentative_timeout_sec: 3.0
+    tentative_max_misses: 1
     track_position_alpha: 0.25
     track_yaw_alpha: 0.20
     track_confidence_alpha: 0.35
@@ -74,6 +79,8 @@ yolo_obb_bev_detector_node:
     stable_track_topic: /tracking/stable_tracks
     publish_stable_tracks: true
     stable_track_include_lost: true
+    publish_tentative_tracks: false
+    show_tentative_markers: false
     bev_image_topic: /detection/bev_image
     publish_bev_image: true
 
