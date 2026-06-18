@@ -52,7 +52,7 @@ yolo_obb_bev_detector_node:
     track_yaw_gate_deg: 45.0
     track_min_iou: 0.02
     track_max_match_cost: 2.40
-    track_min_detection_confidence: 0.55
+    track_min_detection_confidence: 0.40
     track_confirm_hits: 2
     track_confirmation_min_hits: 4
     track_confirmation_require_consecutive_hits: true
@@ -103,6 +103,12 @@ track_manager_node:
     identity_recovery_use_velocity_prediction: true
     identity_recovery_log_events: true
     identity_preserve_uid_only_on_strict_match: true
+    inventory_id_reuse_enabled: true
+    inventory_id_reuse_ttl_sec: 1800.0
+    inventory_id_reuse_gate_m: 0.75
+    inventory_id_reuse_require_static: true
+    inventory_id_reuse_assigned_only: false
+    inventory_id_reuse_log_events: true
     newly_appeared_hold_sec: 1.5
     motion_static_threshold_m: 0.03
     motion_moving_threshold_m: 0.12

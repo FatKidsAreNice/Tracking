@@ -252,6 +252,12 @@ class TrackManagerNode(Node):
         self.declare_parameter('identity_recovery_use_velocity_prediction', True)
         self.declare_parameter('identity_recovery_log_events', True)
         self.declare_parameter('identity_preserve_uid_only_on_strict_match', True)
+        self.declare_parameter('inventory_id_reuse_enabled', True)
+        self.declare_parameter('inventory_id_reuse_ttl_sec', 1800.0)
+        self.declare_parameter('inventory_id_reuse_gate_m', 0.75)
+        self.declare_parameter('inventory_id_reuse_require_static', True)
+        self.declare_parameter('inventory_id_reuse_assigned_only', False)
+        self.declare_parameter('inventory_id_reuse_log_events', True)
         self.declare_parameter('newly_appeared_hold_sec', 1.5)
         self.declare_parameter('motion_static_threshold_m', 0.03)
         self.declare_parameter('motion_moving_threshold_m', 0.12)
@@ -281,6 +287,12 @@ class TrackManagerNode(Node):
         self.identity_recovery_use_velocity_prediction = bool(self.get_parameter('identity_recovery_use_velocity_prediction').value)
         self.identity_recovery_log_events = bool(self.get_parameter('identity_recovery_log_events').value)
         self.identity_preserve_uid_only_on_strict_match = bool(self.get_parameter('identity_preserve_uid_only_on_strict_match').value)
+        self.inventory_id_reuse_enabled = bool(self.get_parameter('inventory_id_reuse_enabled').value)
+        self.inventory_id_reuse_ttl_sec = float(self.get_parameter('inventory_id_reuse_ttl_sec').value)
+        self.inventory_id_reuse_gate_m = float(self.get_parameter('inventory_id_reuse_gate_m').value)
+        self.inventory_id_reuse_require_static = bool(self.get_parameter('inventory_id_reuse_require_static').value)
+        self.inventory_id_reuse_assigned_only = bool(self.get_parameter('inventory_id_reuse_assigned_only').value)
+        self.inventory_id_reuse_log_events = bool(self.get_parameter('inventory_id_reuse_log_events').value)
         self.newly_appeared_hold_sec = float(self.get_parameter('newly_appeared_hold_sec').value)
         self.motion_static_threshold_m = float(self.get_parameter('motion_static_threshold_m').value)
         self.motion_moving_threshold_m = float(self.get_parameter('motion_moving_threshold_m').value)
@@ -306,6 +318,7 @@ class TrackManagerNode(Node):
 
         self.tracks: Dict[int, Track] = {}
         self.identity_lost_tracks: Dict[int, Track] = {}
+        self.dormant_inventory_tracks: Dict[int, Track] = {}
         self.next_track_id = 1
         self.last_stamp_sec = 0.0
         self.last_stamp_msg = None
@@ -375,6 +388,14 @@ class TrackManagerNode(Node):
             f'ambiguous_gap={self.identity_recovery_max_ambiguous_score_gap:.2f}, '
             f'use_velocity_prediction={self.identity_recovery_use_velocity_prediction}, '
             f'preserve_uid_only_on_strict={self.identity_preserve_uid_only_on_strict_match}'
+        )
+        self.get_logger().info(
+            f'Inventory ID reuse: enabled={self.inventory_id_reuse_enabled}, '
+            f'ttl_sec={self.inventory_id_reuse_ttl_sec:.2f}, '
+            f'gate_m={self.inventory_id_reuse_gate_m:.2f}, '
+            f'require_static={self.inventory_id_reuse_require_static}, '
+            f'assigned_only={self.inventory_id_reuse_assigned_only}, '
+            f'log_events={self.inventory_id_reuse_log_events}'
         )
         self.get_logger().info(
             f'Motion logic: hold_sec={self.newly_appeared_hold_sec:.2f}, '
@@ -661,6 +682,40 @@ class TrackManagerNode(Node):
                 )
                 continue
 
+            inventory_track = self.find_inventory_reuse_match(
+                observation=observation,
+                accepted_tracks=accepted_tracks,
+                stamp_sec=stamp_sec,
+            )
+            if inventory_track is not None:
+                if inventory_track.track_id in accepted_tracks:
+                    self.log_inventory_reuse_event(
+                        f'inventory_reuse_rejected_duplicate_active_id track_id={inventory_track.track_id} '
+                        f'new_source_track_id={observation.source_track_id}'
+                    )
+                    continue
+                accepted_tracks[inventory_track.track_id] = self.build_track_from_observation(
+                    observation=observation,
+                    persistent_track_id=inventory_track.track_id,
+                    stamp_sec=stamp_sec,
+                    frame_id=frame_id,
+                    previous_track=inventory_track,
+                    identity_state=inventory_track.identity_state,
+                    identity_confidence=max(inventory_track.identity_confidence, 1.0),
+                    strict_identity_match=inventory_track.last_strict_identity_match,
+                    preserve_barcode=True,
+                )
+                accepted_track_ids.add(inventory_track.track_id)
+                consumed_source_ids.add(observation.source_track_id)
+                self.dormant_inventory_tracks.pop(inventory_track.track_id, None)
+                self.log_inventory_reuse_event(
+                    f'inventory_reuse_success track_id={inventory_track.track_id} '
+                    f'new_source_track_id={observation.source_track_id} '
+                    f'barcode_id={inventory_track.barcode_id or "-"} '
+                    f'marriage_state={inventory_track.marriage_state}'
+                )
+                continue
+
             new_track = self.build_track_from_observation(
                 observation=observation,
                 persistent_track_id=self.next_track_id,
@@ -679,6 +734,12 @@ class TrackManagerNode(Node):
         self.identity_lost_tracks = self.build_identity_lost_tracks(
             previous_tracks=previous_tracks,
             previous_candidates=previous_candidates,
+            accepted_track_ids=accepted_track_ids,
+            stamp_sec=stamp_sec,
+            frame_id=frame_id,
+        )
+        self.update_dormant_inventory_tracks(
+            previous_tracks=previous_tracks,
             accepted_track_ids=accepted_track_ids,
             stamp_sec=stamp_sec,
             frame_id=frame_id,
@@ -1136,6 +1197,10 @@ class TrackManagerNode(Node):
         if self.identity_recovery_log_events:
             self.get_logger().info(message)
 
+    def log_inventory_reuse_event(self, message: str) -> None:
+        if self.inventory_id_reuse_log_events:
+            self.get_logger().info(message)
+
     def is_initialization_mode(self, stamp_sec: float) -> bool:
         if self.initialization_end_sec is None:
             return self.assignment_initialization_duration_sec > 0.0
@@ -1209,6 +1274,169 @@ class TrackManagerNode(Node):
 
     def update_track_assignment_state(self, track: Track) -> None:
         track.marriage_state = self.compute_marriage_state(track)
+
+    def is_inventory_reuse_eligible_track(self, track: Track) -> bool:
+        if track.state != 'confirmed':
+            return False
+        if self.inventory_id_reuse_require_static and track.motion_state != self.MOTION_STATIC:
+            return False
+        if self.inventory_id_reuse_assigned_only:
+            return bool(track.barcode_id.strip())
+        return bool(track.barcode_id.strip()) or track.marriage_state == self.MARRIAGE_KNOWN_EXISTING
+
+    def prune_dormant_inventory_tracks(self, stamp_sec: float) -> None:
+        if self.inventory_id_reuse_ttl_sec < 0.0:
+            return
+        expired_track_ids = [
+            track_id
+            for track_id, track in self.dormant_inventory_tracks.items()
+            if (stamp_sec - track.last_seen_sec) > self.inventory_id_reuse_ttl_sec
+        ]
+        for track_id in expired_track_ids:
+            track = self.dormant_inventory_tracks.pop(track_id, None)
+            if track is None:
+                continue
+            self.log_inventory_reuse_event(
+                f'inventory_reuse_expired track_id={track.track_id} '
+                f'source_track_id={track.source_track_id} age_sec={max(stamp_sec - track.last_seen_sec, 0.0):.2f}'
+            )
+
+    def update_dormant_inventory_tracks(
+        self,
+        previous_tracks: Dict[int, Track],
+        accepted_track_ids: set[int],
+        stamp_sec: float,
+        frame_id: str,
+    ) -> None:
+        if not self.inventory_id_reuse_enabled:
+            self.dormant_inventory_tracks.clear()
+            return
+
+        updated_dormant_tracks = dict(self.dormant_inventory_tracks)
+        for track_id, previous_track in previous_tracks.items():
+            if track_id in accepted_track_ids:
+                updated_dormant_tracks.pop(track_id, None)
+                continue
+            if not self.is_inventory_reuse_eligible_track(previous_track):
+                updated_dormant_tracks.pop(track_id, None)
+                continue
+            updated_dormant_tracks[track_id] = self.build_dormant_inventory_track(previous_track, frame_id)
+
+        self.dormant_inventory_tracks = updated_dormant_tracks
+        self.prune_dormant_inventory_tracks(stamp_sec)
+
+    def find_inventory_reuse_match(
+        self,
+        observation: SourceTrackObservation,
+        accepted_tracks: Dict[int, Track],
+        stamp_sec: float,
+    ) -> Track | None:
+        if not self.inventory_id_reuse_enabled:
+            return None
+        if observation.state != 'confirmed':
+            return None
+
+        self.prune_dormant_inventory_tracks(stamp_sec)
+        candidates: list[tuple[Track, float]] = []
+        rejected_motion = False
+
+        for candidate_track in self.dormant_inventory_tracks.values():
+            if candidate_track.track_id in accepted_tracks:
+                self.log_inventory_reuse_event(
+                    f'inventory_reuse_rejected_duplicate_active_id track_id={candidate_track.track_id} '
+                    f'new_source_track_id={observation.source_track_id}'
+                )
+                continue
+
+            if not self.is_class_compatible(observation.class_name, candidate_track.class_name):
+                self.log_inventory_reuse_event(
+                    f'inventory_reuse_rejected_class track_id={candidate_track.track_id} '
+                    f'new_source_track_id={observation.source_track_id} '
+                    f'candidate_class={candidate_track.class_name} new_class={observation.class_name}'
+                )
+                continue
+
+            if self.inventory_id_reuse_require_static and candidate_track.motion_state != self.MOTION_STATIC:
+                rejected_motion = True
+                self.log_inventory_reuse_event(
+                    f'inventory_reuse_rejected_motion track_id={candidate_track.track_id} '
+                    f'new_source_track_id={observation.source_track_id} motion_state={candidate_track.motion_state}'
+                )
+                continue
+
+            predicted_position = candidate_track.centroid
+            if self.identity_recovery_use_velocity_prediction:
+                dt = max(stamp_sec - candidate_track.last_seen_sec, 0.0)
+                predicted_position = candidate_track.centroid + candidate_track.velocity * dt
+
+            distance_m = float(np.linalg.norm(observation.center - predicted_position))
+            if distance_m > self.inventory_id_reuse_gate_m:
+                self.log_inventory_reuse_event(
+                    f'inventory_reuse_rejected_distance track_id={candidate_track.track_id} '
+                    f'new_source_track_id={observation.source_track_id} distance_m={distance_m:.2f}'
+                )
+                continue
+
+            self.log_inventory_reuse_event(
+                f'inventory_reuse_candidate_found track_id={candidate_track.track_id} '
+                f'new_source_track_id={observation.source_track_id} distance_m={distance_m:.2f} '
+                f'age_sec={max(stamp_sec - candidate_track.last_seen_sec, 0.0):.2f}'
+            )
+            candidates.append((candidate_track, distance_m))
+
+        if len(candidates) > 1:
+            candidate_ids = ','.join(f'T{candidate.track_id}' for candidate, _ in candidates)
+            self.log_inventory_reuse_event(
+                f'inventory_reuse_rejected_ambiguous new_source_track_id={observation.source_track_id} '
+                f'candidate_ids={candidate_ids}'
+            )
+            return None
+
+        if not candidates:
+            if rejected_motion:
+                return None
+            return None
+
+        return candidates[0][0]
+
+    def build_dormant_inventory_track(self, previous_track: Track, frame_id: str) -> Track:
+        return Track(
+            track_id=previous_track.track_id,
+            centroid=previous_track.centroid.copy(),
+            velocity=previous_track.velocity.copy(),
+            age=previous_track.age,
+            missed_updates=previous_track.missed_updates,
+            last_stamp_sec=previous_track.last_stamp_sec,
+            barcode_id=previous_track.barcode_id,
+            class_id=previous_track.class_id,
+            class_name=previous_track.class_name,
+            state=previous_track.state,
+            confidence=previous_track.confidence,
+            yaw=previous_track.yaw,
+            length=previous_track.length,
+            width=previous_track.width,
+            height=previous_track.height,
+            hit_count=previous_track.hit_count,
+            source_missed_count=previous_track.source_missed_count,
+            frame_id=frame_id or previous_track.frame_id,
+            motion_state=previous_track.motion_state,
+            static_streak=previous_track.static_streak,
+            moving_streak=previous_track.moving_streak,
+            first_seen_sec=previous_track.first_seen_sec,
+            last_seen_sec=previous_track.last_seen_sec,
+            last_confirmed_sec=previous_track.last_confirmed_sec,
+            lost_transition_count=previous_track.lost_transition_count,
+            occluded_transition_count=previous_track.occluded_transition_count,
+            reappeared_count=previous_track.reappeared_count,
+            last_motion_state_change_sec=previous_track.last_motion_state_change_sec,
+            source_track_id=previous_track.source_track_id,
+            last_source_track_id=previous_track.last_source_track_id,
+            identity_recovered_count=previous_track.identity_recovered_count,
+            identity_confidence=previous_track.identity_confidence,
+            identity_state=previous_track.identity_state,
+            last_strict_identity_match=previous_track.last_strict_identity_match,
+            marriage_state=previous_track.marriage_state,
+        )
 
     def barcode_in_use(self, barcode_id: str, exclude_track_id: int = 0) -> bool:
         normalized = barcode_id.strip()
@@ -1295,6 +1523,7 @@ class TrackManagerNode(Node):
 
         del self.tracks[track_id]
         self.identity_lost_tracks.pop(track_id, None)
+        self.dormant_inventory_tracks.pop(track_id, None)
         self.get_logger().info(f'Removed track T{track_id} with barcode "{barcode_id}".')
         self.publish_track_states(self.current_stamp_sec())
         self.publish_track_markers(self.current_stamp_msg())
@@ -1303,6 +1532,7 @@ class TrackManagerNode(Node):
         del request
         self.tracks.clear()
         self.identity_lost_tracks.clear()
+        self.dormant_inventory_tracks.clear()
         self.next_track_id = 1
         self.initialization_start_sec = None
         self.initialization_end_sec = None
