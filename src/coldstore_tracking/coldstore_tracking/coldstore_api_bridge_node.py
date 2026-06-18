@@ -333,9 +333,20 @@ class ColdstoreApiBridgeNode(Node):
 
         eligible, reason, message = self.validate_track_marriage(track)
         if not eligible:
+            blockers = track.get('eligibility_blockers', [])
+            if not isinstance(blockers, list):
+                blockers = []
             handler.send_json_response(
                 HTTPStatus.CONFLICT,
-                {'success': False, 'reason': reason, 'message': message},
+                {
+                    'success': False,
+                    'reason': reason,
+                    'message': message,
+                    'track_id': track_id,
+                    'marriage_state': str(track.get('marriage_state', '')),
+                    'identity_state': str(track.get('identity_state', '')),
+                    'blockers': blockers,
+                },
             )
             return
 
@@ -509,6 +520,9 @@ class ColdstoreApiBridgeNode(Node):
         enriched['eligibility_blockers'] = blockers
         enriched['eligibility_reason'] = reason
         enriched['is_marriage_eligible'] = eligible
+        enriched['identity_safe'] = bool(enriched.get('identity_safe', False))
+        enriched['source_track_changed'] = bool(enriched.get('source_track_changed', False))
+        enriched['is_track_visible'] = bool(enriched.get('is_track_visible', False))
         return enriched
 
     def resolve_zone_for_track(self, x: float, y: float) -> tuple[str, bool]:
@@ -632,22 +646,54 @@ class ColdstoreApiBridgeNode(Node):
 
     @staticmethod
     def validate_track_marriage(track: Dict[str, Any]) -> tuple[bool, str, str]:
+        reason = str(track.get('eligibility_reason', '')).strip() or 'track_not_eligible'
+        blockers = track.get('eligibility_blockers', [])
+        if not isinstance(blockers, list):
+            blockers = []
+
         if str(track.get('barcode_id', '')).strip():
             return False, 'uid_already_assigned', 'Track already has a UID.'
         if str(track.get('marriage_state', '')) != 'unassigned_new':
+            marriage_state = str(track.get('marriage_state', '')).strip()
+            if marriage_state == 'known_existing':
+                return False, 'known_existing', 'Track belongs to known existing inventory and cannot be married as new.'
+            if marriage_state == 'assigned':
+                return False, 'already_assigned', 'Track already belongs to assigned inventory.'
             return False, 'track_not_eligible', 'Track is not a new unassigned track.'
         if not bool(track.get('is_marriage_eligible', False)):
-            return False, 'track_not_eligible', 'Track is moving, unsafe, or outside the allowed zone.'
+            return False, reason, ColdstoreApiBridgeNode.message_for_eligibility_reason(reason, blockers)
         if str(track.get('state', '')) != 'confirmed':
-            return False, 'track_not_eligible', 'Track is not confirmed.'
+            return False, 'not_confirmed', 'Track is not confirmed.'
         if str(track.get('motion_state', '')) != 'static':
-            return False, 'track_not_eligible', 'Track is moving or not yet static.'
+            return False, 'track_moving', 'Track is moving or not yet static.'
         if str(track.get('identity_state', '')) not in {'direct', 'new', 'recovered_strict'}:
-            return False, 'track_not_eligible', 'Track identity state is not safe enough.'
-        blockers = track.get('eligibility_blockers', [])
-        if isinstance(blockers, list) and 'outside_storage_zone' in blockers:
-            return False, 'track_not_eligible', 'Track is outside the allowed storage zone.'
+            return False, 'identity_not_safe', 'Track identity state is not safe enough.'
+        if 'outside_storage_zone' in blockers:
+            return False, 'outside_storage_zone', 'Track is outside the allowed storage zone.'
         return True, 'eligible', 'Track is eligible.'
+
+    @staticmethod
+    def message_for_eligibility_reason(reason: str, blockers: list[str]) -> str:
+        normalized_blockers = [str(item) for item in blockers]
+        if reason == 'known_existing':
+            return 'Track belongs to known existing inventory.'
+        if reason == 'already_assigned':
+            return 'Track already has an assigned UID.'
+        if reason == 'track_lost':
+            return 'Track is currently lost.'
+        if reason == 'track_not_visible':
+            return 'Track is not visible enough for a safe marriage.'
+        if reason == 'not_confirmed':
+            return 'Track is not confirmed yet.'
+        if reason == 'track_moving':
+            return 'Track is moving or not yet static.'
+        if reason == 'identity_recovered_weak':
+            return 'Track identity recovery is too weak for a safe marriage.'
+        if reason == 'identity_not_safe':
+            return 'Track identity is not safe enough for marriage.'
+        if reason == 'outside_storage_zone' or 'outside_storage_zone' in normalized_blockers:
+            return 'Track is outside the allowed storage zone.'
+        return 'Track is currently not eligible for marriage.'
 
     def render_overview_image(self, payload: Dict[str, Any], bev_image: np.ndarray | None) -> np.ndarray | None:
         tracks = [track for track in get_payload_list(payload, 'tracks') if isinstance(track, dict)]

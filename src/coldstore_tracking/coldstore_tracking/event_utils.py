@@ -51,14 +51,22 @@ def as_float(value: Any, default: float = 0.0) -> float:
 def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     frame_id = ''
+    safe_identity_states = {'direct', 'new', 'recovered_strict'}
+    non_visible_motion_states = {'occluded', 'disappeared'}
 
     for track in sorted(tracks.values(), key=lambda item: item.track_id):
         if not frame_id and track.frame_id:
             frame_id = str(track.frame_id)
+        source_track_changed = (
+            int(track.source_track_id) > 0
+            and int(track.last_source_track_id) > 0
+            and int(track.source_track_id) != int(track.last_source_track_id)
+        )
         items.append({
             'track_id': int(track.track_id),
             'source_track_id': int(track.source_track_id),
             'last_source_track_id': int(track.last_source_track_id),
+            'source_track_changed': bool(source_track_changed),
             'barcode_id': str(track.barcode_id),
             'class_id': int(track.class_id),
             'class_name': str(track.class_name),
@@ -68,6 +76,7 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             'identity_recovered_count': int(track.identity_recovered_count),
             'identity_confidence': float(track.identity_confidence),
             'identity_state': str(track.identity_state),
+            'identity_safe': str(track.identity_state) in safe_identity_states,
             'marriage_state': str(track.marriage_state),
             'confidence': float(track.confidence),
             'x': float(track.centroid[0]),
@@ -88,6 +97,7 @@ def build_track_states_payload(tracks: Dict[int, Track], stamp_sec: float) -> Di
             'last_seen_sec': float(track.last_seen_sec),
             'last_confirmed_sec': float(track.last_confirmed_sec),
             'last_seen_age_sec': max(float(stamp_sec) - float(track.last_seen_sec), 0.0),
+            'is_track_visible': str(track.state) == 'confirmed' and str(track.motion_state) not in non_visible_motion_states,
             'lost_transition_count': int(track.lost_transition_count),
             'occluded_transition_count': int(track.occluded_transition_count),
             'reappeared_count': int(track.reappeared_count),

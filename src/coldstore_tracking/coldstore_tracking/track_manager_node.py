@@ -636,6 +636,11 @@ class TrackManagerNode(Node):
             )
             accepted_track_ids.add(previous_track.track_id)
             consumed_source_ids.add(observation.source_track_id)
+            if previous_track.source_track_id > 0 and previous_track.source_track_id != observation.source_track_id:
+                self.log_identity_event(
+                    f'Persistent track T{previous_track.track_id} switched source track from '
+                    f'T{previous_track.source_track_id} to T{observation.source_track_id}'
+                )
 
         remaining_observations = [
             observation
@@ -729,6 +734,10 @@ class TrackManagerNode(Node):
             )
             accepted_tracks[new_track.track_id] = new_track
             accepted_track_ids.add(new_track.track_id)
+            self.log_identity_event(
+                f'Created persistent track T{new_track.track_id} from source T{observation.source_track_id} '
+                f'class={observation.class_name or "-"} state={observation.state}'
+            )
             self.next_track_id += 1
 
         self.identity_lost_tracks = self.build_identity_lost_tracks(

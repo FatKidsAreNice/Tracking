@@ -52,7 +52,7 @@ yolo_obb_bev_detector_node:
     track_yaw_gate_deg: 45.0
     track_min_iou: 0.02
     track_max_match_cost: 2.40
-    track_min_detection_confidence: 0.40
+    track_min_detection_confidence: 0.35
     track_confirm_hits: 2
     track_confirmation_min_hits: 4
     track_confirmation_require_consecutive_hits: true
