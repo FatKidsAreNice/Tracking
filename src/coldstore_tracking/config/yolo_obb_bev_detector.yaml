@@ -125,6 +125,11 @@ track_overview_gui_node:
     map_roi_max: [9.0, 6.0]
     map_pixels_per_meter: 35.0
     map_rotation_deg: 22.0
+    track_overlay_rotation_deg: -90.0
+    track_overlay_flip_x: true
+    track_overlay_flip_y: true
+    track_overlay_offset_x_m: 8.0
+    track_overlay_offset_y_m: 2.0
     auto_trim_rotation_borders: false
     background_mode: floorplan
     floorplan_image_path: floorplan_background.png

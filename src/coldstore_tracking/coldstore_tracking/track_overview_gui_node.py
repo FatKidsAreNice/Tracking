@@ -26,6 +26,11 @@ class TrackOverviewGuiNode(Node):
         self.declare_parameter('map_roi_max', [9.0, 6.0])
         self.declare_parameter('map_pixels_per_meter', 35.0)
         self.declare_parameter('map_rotation_deg', 0.0)
+        self.declare_parameter('track_overlay_rotation_deg', 0.0)
+        self.declare_parameter('track_overlay_flip_x', False)
+        self.declare_parameter('track_overlay_flip_y', False)
+        self.declare_parameter('track_overlay_offset_x_m', 0.0)
+        self.declare_parameter('track_overlay_offset_y_m', 0.0)
         self.declare_parameter('auto_trim_rotation_borders', True)
         self.declare_parameter('background_mode', 'floorplan')
         self.declare_parameter('floorplan_image_path', 'floorplan_background.png')
@@ -48,6 +53,12 @@ class TrackOverviewGuiNode(Node):
         self.map_pixels_per_meter = float(self.get_parameter('map_pixels_per_meter').value)
         self.map_rotation_deg = float(self.get_parameter('map_rotation_deg').value)
         self.map_rotation_rad = math.radians(self.map_rotation_deg)
+        self.track_overlay_rotation_deg = float(self.get_parameter('track_overlay_rotation_deg').value)
+        self.track_rotation_rad = self.map_rotation_rad + math.radians(self.track_overlay_rotation_deg)
+        self.track_overlay_flip_x = bool(self.get_parameter('track_overlay_flip_x').value)
+        self.track_overlay_flip_y = bool(self.get_parameter('track_overlay_flip_y').value)
+        self.track_overlay_offset_x_m = float(self.get_parameter('track_overlay_offset_x_m').value)
+        self.track_overlay_offset_y_m = float(self.get_parameter('track_overlay_offset_y_m').value)
         self.auto_trim_rotation_borders = bool(self.get_parameter('auto_trim_rotation_borders').value)
         self.background_mode = str(self.get_parameter('background_mode').value).strip().lower() or 'bev'
         self.floorplan_image_path = str(self.get_parameter('floorplan_image_path').value).strip()
@@ -96,6 +107,11 @@ class TrackOverviewGuiNode(Node):
             f'track_overview_gui_node started. topic={self.track_state_topic}, '
             f'bev_image_topic={self.bev_image_topic}, lookup_mode={self.lookup_mode}, '
             f'map_rotation_deg={self.map_rotation_deg:.1f}, '
+            f'track_overlay_rotation_deg={self.track_overlay_rotation_deg:.1f}, '
+            f'track_overlay_flip_x={self.track_overlay_flip_x}, '
+            f'track_overlay_flip_y={self.track_overlay_flip_y}, '
+            f'track_overlay_offset_m=({self.track_overlay_offset_x_m:.2f}, '
+            f'{self.track_overlay_offset_y_m:.2f}), '
             f'auto_trim_rotation_borders={self.auto_trim_rotation_borders}, '
             f'background_mode={self.background_mode}, '
             f'floorplan_fit_mode={self.floorplan_fit_mode}, '
@@ -365,7 +381,11 @@ class TrackOverviewGuiNode(Node):
             self.canvas.create_oval(x_px - radius, y_px - radius, x_px + radius, y_px + radius, fill=fill, outline=outline, width=2 if is_selected else 0)
 
             if self.show_track_heading_arrows:
-                yaw = as_float(track.get('yaw', 0.0)) + self.map_rotation_rad
+                yaw = as_float(track.get('yaw', 0.0)) + self.track_rotation_rad
+                if self.track_overlay_flip_y:
+                    yaw = -yaw
+                if self.track_overlay_flip_x:
+                    yaw = math.pi - yaw
                 arrow_length = 26 if is_selected else 18
                 arrow_x = x_px + math.cos(yaw) * arrow_length
                 arrow_y = y_px - math.sin(yaw) * arrow_length
@@ -634,6 +654,12 @@ class TrackOverviewGuiNode(Node):
         x_world, y_world = self.rotate_world_xy(x_world, y_world)
         min_x, min_y = self.map_roi_min
         max_x, max_y = self.map_roi_max
+        if self.track_overlay_flip_x:
+            x_world = min_x + max_x - x_world
+        if self.track_overlay_flip_y:
+            y_world = min_y + max_y - y_world
+        x_world += self.track_overlay_offset_x_m
+        y_world += self.track_overlay_offset_y_m
         usable_width = canvas_width - 2 * self.canvas_padding
         usable_height = canvas_height - 2 * self.canvas_padding
 
@@ -671,15 +697,15 @@ class TrackOverviewGuiNode(Node):
         return x_trimmed, y_trimmed
 
     def rotate_world_xy(self, x_world: float, y_world: float) -> tuple[float, float]:
-        if abs(self.map_rotation_rad) <= 1e-6:
+        if abs(self.track_rotation_rad) <= 1e-6:
             return x_world, y_world
 
         center_x = 0.5 * (self.map_roi_min[0] + self.map_roi_max[0])
         center_y = 0.5 * (self.map_roi_min[1] + self.map_roi_max[1])
         delta_x = x_world - center_x
         delta_y = y_world - center_y
-        cos_angle = math.cos(self.map_rotation_rad)
-        sin_angle = math.sin(self.map_rotation_rad)
+        cos_angle = math.cos(self.track_rotation_rad)
+        sin_angle = math.sin(self.track_rotation_rad)
 
         rotated_x = cos_angle * delta_x - sin_angle * delta_y + center_x
         rotated_y = sin_angle * delta_x + cos_angle * delta_y + center_y
