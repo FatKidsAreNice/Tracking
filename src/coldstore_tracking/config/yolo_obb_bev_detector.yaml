@@ -1,6 +1,26 @@
+cloud_transform_merge_node:
+  ros__parameters:
+    mode: multi
+    target_frame: rslidar
+    output_topic: /tracking/merged_cloud
+    lidar_topics: [/rslidar_points, /lidar_02/points]
+
+    # Beide Punktwolken werden bereits im RoboSense-Treiber räumlich ausgerichtet.
+    # Deshalb hier keine alten Simulations-Transforms erneut anwenden.
+    input_clouds_already_in_target_frame: true
+
+    publish_rate_hz: 10.0
+    stale_cloud_timeout_sec: 0.6
+    voxel_size: 0.0
+    merged_voxel_size: 0.0
+
+    # Gleiche räumliche Grenzen wie im nachfolgenden YOLO-BEV.
+    roi_min: [-14.5, -15.0, -2.0]
+    roi_max: [9.0, 6.0, 3.0]
+
 yolo_obb_bev_detector_node:
   ros__parameters:
-    input_topic: /rslidar_points
+    input_topic: /tracking/merged_cloud
     expected_frame_id: rslidar
     output_frame: rslidar
 

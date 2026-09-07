@@ -22,6 +22,8 @@ class CloudTransformMergeNode(Node):
         self.declare_parameter('voxel_size', 0.04)
         self.declare_parameter('merged_voxel_size', 0.04)
         self.declare_parameter('stale_cloud_timeout_sec', 0.6)
+        self.declare_parameter('input_clouds_already_in_target_frame', False)
+        self.declare_parameter('output_topic', '/tracking/merged_cloud')
         self.declare_parameter('roi_min', [-1.5, -1.5, 0.0])
         self.declare_parameter('roi_max', [1.5, 1.5, 2.5])
 
@@ -47,6 +49,10 @@ class CloudTransformMergeNode(Node):
         self.voxel_size = float(self.get_parameter('voxel_size').value)
         self.merged_voxel_size = float(self.get_parameter('merged_voxel_size').value)
         self.stale_cloud_timeout_sec = float(self.get_parameter('stale_cloud_timeout_sec').value)
+        self.input_clouds_already_in_target_frame = bool(
+            self.get_parameter('input_clouds_already_in_target_frame').value
+        )
+        self.output_topic = str(self.get_parameter('output_topic').value)
         self.roi_min = np.asarray(self.get_parameter('roi_min').value, dtype=np.float32)
         self.roi_max = np.asarray(self.get_parameter('roi_max').value, dtype=np.float32)
 
@@ -69,10 +75,10 @@ class CloudTransformMergeNode(Node):
         self.sensor_transform_map = build_sensor_transform_map()
 
         self.latest_points_by_topic: Dict[str, np.ndarray] = {}
-        self.latest_stamp_by_topic: Dict[str, float] = {}
+        self.latest_receive_time_by_topic: Dict[str, float] = {}
         self.latest_msg_stamp = None
 
-        self.merged_cloud_pub = self.create_publisher(PointCloud2, '/tracking/merged_cloud', 10)
+        self.merged_cloud_pub = self.create_publisher(PointCloud2, self.output_topic, 10)
         self.subscribers = []
 
         if self.mode == 'single':
@@ -93,11 +99,16 @@ class CloudTransformMergeNode(Node):
         self.get_logger().info('cloud_transform_merge_node started.')
         self.get_logger().info(f'Mode: {self.mode}')
         self.get_logger().info(f'Target frame: {self.target_frame}')
+        self.get_logger().info(f'Output topic: {self.output_topic}')
         if self.mode == 'single':
             self.get_logger().info(f'Input topic: {self.input_topic}')
             self.get_logger().info(f'Sensor pose xyzrpy: {self.sensor_pose.tolist()}')
         else:
             self.get_logger().info(f'Lidar topics: {self.lidar_topics}')
+            self.get_logger().info(
+                'Input clouds already in target frame: '
+                f'{self.input_clouds_already_in_target_frame}'
+            )
 
     def cloud_callback(self, topic_name: str, cloud_msg: PointCloud2) -> None:
         transform_matrix = self.resolve_transform(cloud_msg)
@@ -107,7 +118,7 @@ class CloudTransformMergeNode(Node):
         points_xyz = extract_xyz_points(cloud_msg)
         if points_xyz.size == 0:
             self.latest_points_by_topic[topic_name] = np.empty((0, 3), dtype=np.float32)
-            self.latest_stamp_by_topic[topic_name] = self.msg_time_to_sec(cloud_msg)
+            self.latest_receive_time_by_topic[topic_name] = self.current_time_to_sec()
             self.latest_msg_stamp = cloud_msg.header.stamp
             return
 
@@ -116,7 +127,7 @@ class CloudTransformMergeNode(Node):
         downsampled_points = voxel_downsample(cropped_points, self.voxel_size)
 
         self.latest_points_by_topic[topic_name] = downsampled_points
-        self.latest_stamp_by_topic[topic_name] = self.msg_time_to_sec(cloud_msg)
+        self.latest_receive_time_by_topic[topic_name] = self.current_time_to_sec()
         self.latest_msg_stamp = cloud_msg.header.stamp
 
     def resolve_transform(self, cloud_msg: PointCloud2) -> Optional[np.ndarray]:
@@ -128,6 +139,9 @@ class CloudTransformMergeNode(Node):
                     throttle_duration_sec=5.0,
                 )
             return self.single_sensor_transform
+
+        if self.input_clouds_already_in_target_frame:
+            return np.eye(4, dtype=np.float32)
 
         frame_id = cloud_msg.header.frame_id
         transform_matrix = self.sensor_transform_map.get(frame_id)
@@ -144,17 +158,17 @@ class CloudTransformMergeNode(Node):
         if self.latest_msg_stamp is None:
             return
 
-        if not self.latest_stamp_by_topic:
+        if not self.latest_receive_time_by_topic:
             return
 
-        reference_time_sec = max(self.latest_stamp_by_topic.values())
+        current_time_sec = self.current_time_to_sec()
         merged_parts = []
 
         for topic_name, points_xyz in self.latest_points_by_topic.items():
-            msg_stamp_sec = self.latest_stamp_by_topic.get(topic_name)
-            if msg_stamp_sec is None:
+            receive_time_sec = self.latest_receive_time_by_topic.get(topic_name)
+            if receive_time_sec is None:
                 continue
-            if (reference_time_sec - msg_stamp_sec) > self.stale_cloud_timeout_sec:
+            if (current_time_sec - receive_time_sec) > self.stale_cloud_timeout_sec:
                 continue
             if points_xyz.size == 0:
                 continue
@@ -168,10 +182,8 @@ class CloudTransformMergeNode(Node):
         merged_msg = create_xyz_cloud(self.target_frame, self.latest_msg_stamp, merged_points)
         self.merged_cloud_pub.publish(merged_msg)
 
-    @staticmethod
-    def msg_time_to_sec(cloud_msg: PointCloud2) -> float:
-        stamp = cloud_msg.header.stamp
-        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+    def current_time_to_sec(self) -> float:
+        return float(self.get_clock().now().nanoseconds) * 1e-9
 
 
 def main(args=None) -> None:

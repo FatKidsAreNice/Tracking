@@ -33,6 +33,25 @@ def generate_launch_description() -> LaunchDescription:
                 description='Start the HTTP API bridge for overview, BEV image and barcode scans.',
             ),
             Node(
+                package='tf2_ros',
+                executable='static_transform_publisher',
+                name='tf_rslidar_to_lidar_02',
+                output='screen',
+                arguments=[
+                    '--x', '0.0', '--y', '0.0', '--z', '0.0',
+                    '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
+                    '--frame-id', 'rslidar',
+                    '--child-frame-id', 'lidar_02',
+                ],
+            ),
+            Node(
+                package='coldstore_tracking',
+                executable='cloud_transform_merge_node',
+                name='cloud_transform_merge_node',
+                output='screen',
+                parameters=[params_file],
+            ),
+            Node(
                 package='coldstore_tracking',
                 executable='yolo_obb_bev_detector_node',
                 name='yolo_obb_bev_detector_node',
