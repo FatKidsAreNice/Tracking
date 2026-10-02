@@ -24,6 +24,7 @@ class CloudTransformMergeNode(Node):
         self.declare_parameter('stale_cloud_timeout_sec', 0.6)
         self.declare_parameter('input_clouds_already_in_target_frame', False)
         self.declare_parameter('output_topic', '/tracking/merged_cloud')
+        self.declare_parameter('crop_enabled', True)
         self.declare_parameter('roi_min', [-1.5, -1.5, 0.0])
         self.declare_parameter('roi_max', [1.5, 1.5, 2.5])
 
@@ -53,6 +54,7 @@ class CloudTransformMergeNode(Node):
             self.get_parameter('input_clouds_already_in_target_frame').value
         )
         self.output_topic = str(self.get_parameter('output_topic').value)
+        self.crop_enabled = bool(self.get_parameter('crop_enabled').value)
         self.roi_min = np.asarray(self.get_parameter('roi_min').value, dtype=np.float32)
         self.roi_max = np.asarray(self.get_parameter('roi_max').value, dtype=np.float32)
 
@@ -100,6 +102,7 @@ class CloudTransformMergeNode(Node):
         self.get_logger().info(f'Mode: {self.mode}')
         self.get_logger().info(f'Target frame: {self.target_frame}')
         self.get_logger().info(f'Output topic: {self.output_topic}')
+        self.get_logger().info(f'ROI cropping enabled: {self.crop_enabled}')
         if self.mode == 'single':
             self.get_logger().info(f'Input topic: {self.input_topic}')
             self.get_logger().info(f'Sensor pose xyzrpy: {self.sensor_pose.tolist()}')
@@ -123,8 +126,10 @@ class CloudTransformMergeNode(Node):
             return
 
         world_points = transform_points(points_xyz, transform_matrix)
-        cropped_points = crop_points(world_points, self.roi_min, self.roi_max)
-        downsampled_points = voxel_downsample(cropped_points, self.voxel_size)
+        processed_points = world_points
+        if self.crop_enabled:
+            processed_points = crop_points(processed_points, self.roi_min, self.roi_max)
+        downsampled_points = voxel_downsample(processed_points, self.voxel_size)
 
         self.latest_points_by_topic[topic_name] = downsampled_points
         self.latest_receive_time_by_topic[topic_name] = self.current_time_to_sec()

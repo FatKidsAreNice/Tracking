@@ -13,8 +13,10 @@ cloud_transform_merge_node:
     stale_cloud_timeout_sec: 0.6
     voxel_size: 0.0
     merged_voxel_size: 0.0
+    crop_enabled: false
 
-    # Gleiche räumliche Grenzen wie im nachfolgenden YOLO-BEV.
+    # Bleibt für ein optionales Merge-Cropping konfiguriert. YOLO wendet seine
+    # eigene ROI weiterhin unabhängig davon an.
     roi_min: [-14.5, -15.0, -2.0]
     roi_max: [9.0, 6.0, 3.0]
 
