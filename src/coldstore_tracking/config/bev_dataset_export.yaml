@@ -1,12 +1,15 @@
 bev_dataset_export_node:
   ros__parameters:
-    input_topic: /rslidar_points
+    input_topic: /tracking/merged_cloud
     expected_frame_id: rslidar
-    output_root: ~/ros2_ws/bev_dataset
+    output_root: ~/ros2_ws/bev_dataset/merged_two_week_capture
 
-    roi_min: [-14.5, -15.0, -2.0]
-    roi_max: [9.0, 6.0, 3.0]
+    # Grenzen im um 80 Grad gedrehten BEV-Koordinatensystem. Sie decken die
+    # robuste merged-cloud-Ausdehnung mit rund 1-2 m Sicherheitsrand ab.
+    roi_min: [-10.0, -11.0, -2.0]
+    roi_max: [21.0, 14.0, 3.0]
     resolution_m_per_px: 0.01
+    bev_rotation_clockwise_deg: 80.0
 
     sample_interval_sec: 60.0
     min_save_interval_sec: 1800.0
@@ -16,3 +19,6 @@ bev_dataset_export_node:
     density_clip_count: 12
     min_points_to_save: 1000
     max_saved_frames: 0
+
+    # 14 Tage; der Exporter beendet sich anschließend automatisch.
+    capture_duration_sec: 1209600.0

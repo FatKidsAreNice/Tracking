@@ -117,6 +117,54 @@ class BevGeometry:
         return np.stack((x_values, y_values), axis=1).astype(np.float32)
 
 
+class BevCoordinateRotation:
+    """Rotate world XY coordinates before ROI filtering and BEV rasterization."""
+
+    def __init__(self, geometry: BevGeometry, clockwise_deg: float) -> None:
+        self.geometry = geometry
+        self.clockwise_deg = float(clockwise_deg)
+        # Keep the rotation independent from ROI changes. The ROS frame origin
+        # is the stable pivot shared by dataset export and live inference.
+        self.center_xy = np.zeros(2, dtype=np.float64)
+
+        angle_rad = math.radians(-self.clockwise_deg)
+        cos_angle = math.cos(angle_rad)
+        sin_angle = math.sin(angle_rad)
+        rotation = np.asarray(
+            [[cos_angle, -sin_angle], [sin_angle, cos_angle]],
+            dtype=np.float64,
+        )
+        inverse_rotation = rotation.T
+
+        self.forward_matrix = self.build_affine_matrix(rotation)
+        self.inverse_matrix = self.build_affine_matrix(inverse_rotation)
+
+    def build_affine_matrix(self, rotation: np.ndarray) -> np.ndarray:
+        translation = self.center_xy - rotation @ self.center_xy
+        return np.column_stack((rotation, translation)).astype(np.float64)
+
+    @staticmethod
+    def transform_points_with_matrix(points_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+        points_xy = np.asarray(points_xy, dtype=np.float64).reshape(-1, 2)
+        homogeneous = np.column_stack((points_xy, np.ones(points_xy.shape[0], dtype=np.float64)))
+        return (homogeneous @ np.asarray(matrix, dtype=np.float64).T).astype(np.float32)
+
+    def forward_points_xy(self, points_xy: np.ndarray) -> np.ndarray:
+        return self.transform_points_with_matrix(points_xy, self.forward_matrix)
+
+    def inverse_points_xy(self, points_xy: np.ndarray) -> np.ndarray:
+        return self.transform_points_with_matrix(points_xy, self.inverse_matrix)
+
+    def forward_points_xyz(self, points_xyz: np.ndarray) -> np.ndarray:
+        points_xyz = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+        if points_xyz.size == 0 or abs(self.clockwise_deg) <= 1e-9:
+            return points_xyz
+
+        rotated = points_xyz.copy()
+        rotated[:, :2] = self.forward_points_xy(points_xyz[:, :2])
+        return rotated
+
+
 class PointCloudReader:
     @staticmethod
     def to_xyz_array(msg: PointCloud2) -> np.ndarray:

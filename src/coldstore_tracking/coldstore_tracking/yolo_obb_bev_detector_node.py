@@ -19,9 +19,9 @@ from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 try:
-    from .bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
+    from .bev_utils import BevCoordinateRotation, BevGeometry, BevImageBuilder, PointCloudReader
 except ImportError:
-    from bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
+    from bev_utils import BevCoordinateRotation, BevGeometry, BevImageBuilder, PointCloudReader
 
 try:
     from ultralytics import YOLO
@@ -734,10 +734,12 @@ class ClassThresholdFilter:
         confidence_threshold: float,
         side_confidence_threshold: float,
         top_confidence_threshold: float,
+        entrance_confidence_threshold: float,
     ) -> None:
         self.confidence_threshold = float(confidence_threshold)
         self.side_confidence_threshold = float(side_confidence_threshold)
         self.top_confidence_threshold = float(top_confidence_threshold)
+        self.entrance_confidence_threshold = float(entrance_confidence_threshold)
 
     def keep(self, candidate: DetectionCandidate) -> bool:
         if candidate.confidence < self.confidence_threshold:
@@ -748,6 +750,9 @@ class ClassThresholdFilter:
 
         if candidate.class_id == 1:
             return candidate.confidence >= self.top_confidence_threshold
+
+        if candidate.class_id == 2:
+            return candidate.confidence >= self.entrance_confidence_threshold
 
         return False
 
@@ -913,6 +918,7 @@ class RackDetectionConverter:
     CLASS_NAMES = {
         0: "rack_side_visible",
         1: "rack_top_visible",
+        2: "rack_entrance_visible",
     }
 
     def __init__(
@@ -924,6 +930,7 @@ class RackDetectionConverter:
         marker_fixed_yaw_rad: float,
         marker_yaw_snap_step_deg: float,
         marker_yaw_snap_offset_deg: float,
+        bev_rotation: BevCoordinateRotation,
     ) -> None:
         self.geometry = geometry
         self.marker_length = float(marker_size[0])
@@ -934,6 +941,7 @@ class RackDetectionConverter:
         self.marker_fixed_yaw_rad = float(marker_fixed_yaw_rad)
         self.marker_yaw_snap_step_rad = math.radians(float(marker_yaw_snap_step_deg))
         self.marker_yaw_snap_offset_rad = math.radians(float(marker_yaw_snap_offset_deg))
+        self.bev_rotation = bev_rotation
 
     def convert(
         self,
@@ -941,7 +949,8 @@ class RackDetectionConverter:
         candidate: DetectionCandidate,
     ) -> RackDetection:
         pixel_corners = np.asarray(candidate.pixel_corners, dtype=np.float32).reshape(4, 2)
-        world_corners = self.geometry.pixel_to_world_xy(pixel_corners)
+        bev_corners = self.geometry.pixel_to_world_xy(pixel_corners)
+        world_corners = self.bev_rotation.inverse_points_xy(bev_corners)
 
         center_xy = np.mean(world_corners, axis=0)
         yaw = self.normalize_marker_yaw(self.compute_yaw(world_corners))
@@ -1095,10 +1104,14 @@ class MarkerFactory:
             marker.color.r = 0.0
             marker.color.g = 1.0
             marker.color.b = 0.0
-        else:
+        elif detection.class_id == 1:
             marker.color.r = 1.0
             marker.color.g = 0.65
             marker.color.b = 0.0
+        else:
+            marker.color.r = 0.1
+            marker.color.g = 0.45
+            marker.color.b = 1.0
 
         if detection.track_state == TrackStabilizer.STATE_TENTATIVE:
             marker.color.a = self.marker_alpha * 0.25
@@ -1302,6 +1315,10 @@ class YoloObbBevDetectorNode(Node):
             geometry=self.display_geometry,
             density_clip_count=self.density_clip_count,
         )
+        self.bev_rotation = BevCoordinateRotation(
+            geometry=self.geometry,
+            clockwise_deg=self.bev_rotation_clockwise_deg,
+        )
         self.tile_planner = TilePlanner(
             tile_size_px=self.tile_size_px,
             overlap_ratio=self.tile_overlap_ratio,
@@ -1310,6 +1327,7 @@ class YoloObbBevDetectorNode(Node):
             confidence_threshold=self.confidence_threshold,
             side_confidence_threshold=self.side_confidence_threshold,
             top_confidence_threshold=self.top_confidence_threshold,
+            entrance_confidence_threshold=self.entrance_confidence_threshold,
         )
         self.obb_nms = OrientedBoxNms(
             iou_threshold=self.obb_nms_iou_threshold,
@@ -1329,6 +1347,7 @@ class YoloObbBevDetectorNode(Node):
             marker_fixed_yaw_rad=self.marker_fixed_yaw_rad,
             marker_yaw_snap_step_deg=self.marker_yaw_snap_step_deg,
             marker_yaw_snap_offset_deg=self.marker_yaw_snap_offset_deg,
+            bev_rotation=self.bev_rotation,
         )
         self.track_stabilizer = TrackStabilizer(
             match_distance_m=self.track_match_distance_m,
@@ -1402,6 +1421,10 @@ class YoloObbBevDetectorNode(Node):
             f"@ {self.geometry.resolution_m_per_px:.4f} m/px"
         )
         self.get_logger().info(
+            f"BEV coordinate rotation before ROI crop: "
+            f"{self.bev_rotation_clockwise_deg:.1f} deg clockwise"
+        )
+        self.get_logger().info(
             f"BEV display padding: x={self.bev_padding_m_x:.2f}m, y={self.bev_padding_m_y:.2f}m"
         )
         self.get_logger().info(f"Display ROI min: {self.display_geometry.roi_min.tolist()}")
@@ -1419,6 +1442,7 @@ class YoloObbBevDetectorNode(Node):
             f"global_conf={self.confidence_threshold}, "
             f"side_conf={self.side_confidence_threshold}, "
             f"top_conf={self.top_confidence_threshold}, "
+            f"entrance_conf={self.entrance_confidence_threshold}, "
             f"obb_nms_iou={self.obb_nms_iou_threshold}"
         )
         self.get_logger().info(
@@ -1493,6 +1517,7 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("roi_min", [-14.5, -15.0, -2.0])
         self.declare_parameter("roi_max", [9.0, 6.0, 3.0])
         self.declare_parameter("resolution_m_per_px", 0.01)
+        self.declare_parameter("bev_rotation_clockwise_deg", 0.0)
         self.declare_parameter("bev_padding_m", 1.0)
         self.declare_parameter("bev_padding_m_x", 0.0)
         self.declare_parameter("bev_padding_m_y", 0.0)
@@ -1511,6 +1536,7 @@ class YoloObbBevDetectorNode(Node):
         self.declare_parameter("tile_overlap_ratio", 0.25)
         self.declare_parameter("side_confidence_threshold", 0.20)
         self.declare_parameter("top_confidence_threshold", 0.05)
+        self.declare_parameter("entrance_confidence_threshold", 0.20)
         self.declare_parameter("obb_nms_iou_threshold", 0.20)
 
         self.declare_parameter("deduplicate_physical_racks", True)
@@ -1577,6 +1603,9 @@ class YoloObbBevDetectorNode(Node):
         roi_min = [float(value) for value in self.get_parameter("roi_min").value]
         roi_max = [float(value) for value in self.get_parameter("roi_max").value]
         resolution_m_per_px = float(self.get_parameter("resolution_m_per_px").value)
+        self.bev_rotation_clockwise_deg = float(
+            self.get_parameter("bev_rotation_clockwise_deg").value
+        )
         self.bev_padding_m = max(float(self.get_parameter("bev_padding_m").value), 0.0)
         bev_padding_m_x = max(float(self.get_parameter("bev_padding_m_x").value), 0.0)
         bev_padding_m_y = max(float(self.get_parameter("bev_padding_m_y").value), 0.0)
@@ -1607,6 +1636,9 @@ class YoloObbBevDetectorNode(Node):
         self.tile_overlap_ratio = float(self.get_parameter("tile_overlap_ratio").value)
         self.side_confidence_threshold = float(self.get_parameter("side_confidence_threshold").value)
         self.top_confidence_threshold = float(self.get_parameter("top_confidence_threshold").value)
+        self.entrance_confidence_threshold = float(
+            self.get_parameter("entrance_confidence_threshold").value
+        )
         self.obb_nms_iou_threshold = float(self.get_parameter("obb_nms_iou_threshold").value)
 
         self.deduplicate_physical_racks = bool(self.get_parameter("deduplicate_physical_racks").value)
@@ -1693,11 +1725,12 @@ class YoloObbBevDetectorNode(Node):
         self.last_inference_time_sec = now_sec
 
         points_xyz = PointCloudReader.to_xyz_array(msg)
-        bev_image, stats = self.bev_builder.build(points_xyz)
+        bev_points_xyz = self.bev_rotation.forward_points_xyz(points_xyz)
+        bev_image, stats = self.bev_builder.build(bev_points_xyz)
         display_bev_image = None
         display_stats = None
         if self.publish_bev_image:
-            display_bev_image, display_stats = self.display_bev_builder.build(points_xyz)
+            display_bev_image, display_stats = self.display_bev_builder.build(bev_points_xyz)
         stats["display_points_in_roi"] = int(display_stats["points_in_roi"]) if display_stats is not None else stats["points_in_roi"]
         stats["display_occupied_pixels"] = (
             int(display_stats["occupied_pixels"]) if display_stats is not None else stats["occupied_pixels"]
@@ -1734,6 +1767,7 @@ class YoloObbBevDetectorNode(Node):
 
         side_count = sum(1 for detection in detections if detection.class_id == 0)
         top_count = sum(1 for detection in detections if detection.class_id == 1)
+        entrance_count = sum(1 for detection in detections if detection.class_id == 2)
         confirmed_count = sum(1 for detection in detections if detection.track_state == "confirmed")
         lost_count = sum(1 for detection in detections if detection.track_state == "lost")
 
@@ -1741,7 +1775,7 @@ class YoloObbBevDetectorNode(Node):
             f"Inference #{self.inference_count}: raw={len(raw_detections)}, "
             f"trackable={stats['trackable_detections']}, "
             f"published={len(detections)}, confirmed={confirmed_count}, lost={lost_count}, "
-            f"side={side_count}, top={top_count}, "
+            f"side={side_count}, top={top_count}, entrance={entrance_count}, "
             f"points_in_roi={stats['points_in_roi']}, occupied_pixels={stats['occupied_pixels']}"
         )
 
@@ -1807,7 +1841,7 @@ class YoloObbBevDetectorNode(Node):
         for index, pixel_box in enumerate(pixel_boxes):
             class_id = int(classes[index])
 
-            if class_id not in (0, 1):
+            if class_id not in RackDetectionConverter.CLASS_NAMES:
                 continue
 
             pixel_corners = np.asarray(pixel_box, dtype=np.float32).reshape(4, 2)

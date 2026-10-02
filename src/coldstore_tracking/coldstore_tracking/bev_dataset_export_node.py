@@ -12,9 +12,9 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 
 try:
-    from .bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
+    from .bev_utils import BevCoordinateRotation, BevGeometry, BevImageBuilder, PointCloudReader
 except ImportError:
-    from bev_utils import BevGeometry, BevImageBuilder, PointCloudReader
+    from bev_utils import BevCoordinateRotation, BevGeometry, BevImageBuilder, PointCloudReader
 
 try:
     import cv2
@@ -110,6 +110,7 @@ class BevDatasetExportNode(Node):
         self.declare_parameter("roi_min", [-7.5, -7.5, -3.0])
         self.declare_parameter("roi_max", [7.5, 7.5, 3.0])
         self.declare_parameter("resolution_m_per_px", 0.02)
+        self.declare_parameter("bev_rotation_clockwise_deg", 0.0)
 
         self.declare_parameter("sample_interval_sec", 5.0)
         self.declare_parameter("min_save_interval_sec", 30.0)
@@ -119,6 +120,7 @@ class BevDatasetExportNode(Node):
         self.declare_parameter("density_clip_count", 12)
         self.declare_parameter("min_points_to_save", 1000)
         self.declare_parameter("max_saved_frames", 0)
+        self.declare_parameter("capture_duration_sec", 0.0)
 
         self.input_topic = str(self.get_parameter("input_topic").value)
         self.expected_frame_id = str(self.get_parameter("expected_frame_id").value).strip()
@@ -127,15 +129,23 @@ class BevDatasetExportNode(Node):
         roi_min = [float(value) for value in self.get_parameter("roi_min").value]
         roi_max = [float(value) for value in self.get_parameter("roi_max").value]
         resolution_m_per_px = float(self.get_parameter("resolution_m_per_px").value)
+        self.bev_rotation_clockwise_deg = float(
+            self.get_parameter("bev_rotation_clockwise_deg").value
+        )
 
         self.sample_interval_sec = float(self.get_parameter("sample_interval_sec").value)
         self.min_points_to_save = int(self.get_parameter("min_points_to_save").value)
         self.max_saved_frames = int(self.get_parameter("max_saved_frames").value)
+        self.capture_duration_sec = float(self.get_parameter("capture_duration_sec").value)
 
         self.geometry = BevGeometry.from_roi(roi_min, roi_max, resolution_m_per_px)
         self.bev_builder = BevImageBuilder(
             geometry=self.geometry,
             density_clip_count=int(self.get_parameter("density_clip_count").value),
+        )
+        self.bev_rotation = BevCoordinateRotation(
+            geometry=self.geometry,
+            clockwise_deg=self.bev_rotation_clockwise_deg,
         )
         self.keyframe_decision = KeyframeDecision(
             keyframe_change_ratio=float(self.get_parameter("keyframe_change_ratio").value),
@@ -148,6 +158,15 @@ class BevDatasetExportNode(Node):
         self.received_count = 0
         self.skipped_wrong_frame_count = 0
         self.last_processed_time_sec: Optional[float] = None
+        self.capture_started_time_sec = self.get_clock().now().nanoseconds * 1e-9
+        self.capture_started_local = datetime.now().isoformat(timespec="seconds")
+        self.capture_duration_timer = None
+        if self.capture_duration_sec > 0.0:
+            check_period_sec = min(max(self.capture_duration_sec, 1.0), 60.0)
+            self.capture_duration_timer = self.create_timer(
+                check_period_sec,
+                self.check_capture_duration,
+            )
 
         self.subscription = self.create_subscription(
             PointCloud2,
@@ -166,6 +185,28 @@ class BevDatasetExportNode(Node):
             f"BEV image: {self.geometry.width_px}x{self.geometry.height_px} px "
             f"@ {self.geometry.resolution_m_per_px:.3f} m/px"
         )
+        self.get_logger().info(
+            f"BEV coordinate rotation before ROI crop: "
+            f"{self.bev_rotation_clockwise_deg:.1f} deg clockwise"
+        )
+        if self.capture_duration_sec > 0.0:
+            self.get_logger().info(
+                f"Capture duration: {self.capture_duration_sec:.0f}s "
+                f"({self.capture_duration_sec / 86400.0:.2f} days)"
+            )
+        else:
+            self.get_logger().info("Capture duration: unlimited")
+
+    def check_capture_duration(self) -> None:
+        elapsed_sec = self.get_clock().now().nanoseconds * 1e-9 - self.capture_started_time_sec
+        if elapsed_sec < self.capture_duration_sec:
+            return
+
+        self.get_logger().info(
+            f"Capture duration reached after {elapsed_sec:.1f}s with "
+            f"{self.saved_count} saved frames. Shutting down exporter."
+        )
+        rclpy.shutdown()
 
     def handle_cloud(self, msg: PointCloud2) -> None:
         self.received_count += 1
@@ -190,7 +231,8 @@ class BevDatasetExportNode(Node):
         self.last_processed_time_sec = now_sec
 
         points_xyz = PointCloudReader.to_xyz_array(msg)
-        image, stats = self.bev_builder.build(points_xyz)
+        bev_points_xyz = self.bev_rotation.forward_points_xyz(points_xyz)
+        image, stats = self.bev_builder.build(bev_points_xyz)
 
         if stats["points_in_roi"] < self.min_points_to_save:
             self.get_logger().warn(
@@ -245,6 +287,10 @@ class BevDatasetExportNode(Node):
             "frame_id": msg.header.frame_id,
             "stamp_sec": stamp_sec,
             "saved_at_local": datetime.now().isoformat(timespec="milliseconds"),
+            "capture_started_local": self.capture_started_local,
+            "capture_elapsed_sec": (
+                self.get_clock().now().nanoseconds * 1e-9 - self.capture_started_time_sec
+            ),
             "save_reason": save_reason,
             "change_ratio": change_ratio,
             "roi_min": self.geometry.roi_min.tolist(),
@@ -252,18 +298,23 @@ class BevDatasetExportNode(Node):
             "resolution_m_per_px": self.geometry.resolution_m_per_px,
             "image_width_px": self.geometry.width_px,
             "image_height_px": self.geometry.height_px,
+            "bev_rotation_clockwise_deg": self.bev_rotation_clockwise_deg,
+            "world_xy_to_bev_xy_matrix": self.bev_rotation.forward_matrix.tolist(),
+            "bev_xy_to_world_xy_matrix": self.bev_rotation.inverse_matrix.tolist(),
             "channels": {
                 "0": "occupancy",
                 "1": "max_height_normalized",
                 "2": "density_log_normalized",
             },
             "world_to_pixel": {
-                "u": "floor((x - roi_min_x) / resolution_m_per_px)",
-                "v": "floor((roi_max_y - y) / resolution_m_per_px)",
+                "bev_xy": "world_xy_to_bev_xy_matrix * [world_x, world_y, 1]",
+                "u": "floor((bev_x - roi_min_x) / resolution_m_per_px)",
+                "v": "floor((roi_max_y - bev_y) / resolution_m_per_px)",
             },
             "pixel_to_world": {
-                "x": "roi_min_x + (u + 0.5) * resolution_m_per_px",
-                "y": "roi_max_y - (v + 0.5) * resolution_m_per_px",
+                "bev_x": "roi_min_x + (u + 0.5) * resolution_m_per_px",
+                "bev_y": "roi_max_y - (v + 0.5) * resolution_m_per_px",
+                "world_xy": "bev_xy_to_world_xy_matrix * [bev_x, bev_y, 1]",
             },
             "stats": stats,
         }
